@@ -1,0 +1,32 @@
+partition:
+  strategy: "guts"
+  num_shards: 20
+
+  # KaHyPar parameter
+  epsilon: 0.05
+
+  # deletion influence
+  di_alpha: 0.0
+  di_beta: 0.0
+  di_alpha_static: 0.5
+  di_gamma: 0.5
+  include_isolated_nodes: true
+
+  # weighted hyperedge
+  use_di: true
+
+  # boundary refinement
+  use_boundary_refinement: true
+  refine_epsilon: 0.05
+  refine_max_passes: 20
+  refine_candidate_max_ratio: 0.50
+  lambda_di: 0.0
+  lambda_c: 0.0
+  lambda_l: 0.5
+  refine_class_balance_passes: true
+
+  # it does not work even when the true option is used, because the static graph has no temporal
+  use_temporal_subgraph_assignment: true
+
+output:
+  root: "Results/shard-runs/Cora"

@@ -1,0 +1,57 @@
+partition:
+  num_shards: 130
+  strategy: "guts"
+
+  # KaHyPar parameter
+  epsilon: 0.05
+
+  # deletion influence.
+  di_alpha: 0.5
+  di_beta: 0.5
+
+  # weighted hyperedge
+  use_di: true
+
+  # boundary refinement
+  use_boundary_refinement: true
+  refine_epsilon: 0.05
+  refine_max_passes: 5
+  refine_candidate_max_ratio: 0.10
+  lambda_di: 1.0
+  lambda_c: 0.5
+  lambda_l: 0.0
+
+  # temporal subgraph assignment
+  use_temporal_subgraph_assignment: true
+
+
+training:
+  epochs: 100
+  early_stop_warmup: 20    # early-stop
+  early_stop_patience: 15
+  lr: 1.0e-3
+  weight_decay: 1.0e-5
+  batch_size: 512
+  seed: 2026
+  # GraphSAGE encoder
+  sage_hidden_dim: 128
+  sage_out_dim: 128
+  sage_layers: 2
+  sage_dropout: 0.1
+  sage_num_neighbors: [10, 10]
+  # GRU decoder
+  id_embedding_dim: 128
+  gru_hidden_dim: 128
+  gru_layers: 1
+  gru_dropout: 0.0
+  # training control
+
+temporal_graph:
+  window_size: 3
+
+data:
+  nextgrid_processed_dir: "processed/yjmob_1_14d"
+
+output:
+  root: "Results/shard-runs/yjmob_14d"
+  run_name: ""

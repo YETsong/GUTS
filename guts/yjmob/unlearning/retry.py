@@ -1,0 +1,145 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+from typing import List
+
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from guts.utils import append_log, relpath_for_log
+from guts.config import load_config
+from guts.yjmob.unlearning.unlearn import _resolve_eval_data_dir, retrain_shards_parallel, run_eval
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--out_dir", required=True,
+                   help="unlearn output directory from guts/yjmob/unlearning/unlearn.py")
+    p.add_argument("--shard_ids", type=int, nargs="*", default=None,
+                   help="shard ids to retry (default: shards missing both results.json and shard_run_best.pt)")
+    p.add_argument("--num_gpus", type=int, default=4)
+    p.add_argument("--skip_eval", action="store_true")
+    p.add_argument("--eval_data_dir", default="")
+    return p.parse_args()
+
+
+def _detect_pending_shards(dst_graphsage: str) -> List[int]:
+    pending = []
+    if not os.path.isdir(dst_graphsage):
+        return pending
+    for name in sorted(os.listdir(dst_graphsage)):
+        if not name.startswith("shard_"):
+            continue
+        shard_dir = os.path.join(dst_graphsage, name)
+        if not os.path.exists(os.path.join(shard_dir, "args.json")):
+            continue
+        has_results = os.path.exists(os.path.join(shard_dir, "results.json"))
+        has_untouched_ckpt = os.path.exists(os.path.join(shard_dir, "checkpoints", "shard_run_best.pt"))
+        if not has_results and not has_untouched_ckpt:
+            pending.append(int(name.split("_", 1)[1]))
+    return pending
+
+
+def _parse_state_dir(log_path: str) -> str:
+    if not os.path.exists(log_path):
+        return ""
+    text = open(log_path, encoding="utf-8").read()
+    match = re.search(r"\[UnlearnIndex\] state_dir=(\S+)", text)
+    if match:
+        return match.group(1)
+    match = re.search(r"state_dir\s*:\s*(\S.*)", text)
+    return match.group(1).strip() if match else ""
+
+
+def _parse_forget_request(log_path: str) -> dict:
+    forget_type, description, affected_shards = "unknown", "", []
+    if os.path.exists(log_path):
+        text = open(log_path, encoding="utf-8").read()
+        m = re.search(r"GraphSAGE UNLEARNING\s+type=(\S+)", text)
+        if m:
+            forget_type = m.group(1)
+        m = re.search(r"Forget targets:\s*(.+)", text)
+        if m:
+            description = m.group(1).strip()
+        m = re.search(r"Retrain target shards:\s*\d+/\d+\s*->\s*(\[[^\]]*\])", text)
+        if m:
+            affected_shards = json.loads(m.group(1))
+    return {
+        "forget_type": forget_type,
+        "description": description,
+        "affected_shards": affected_shards,
+    }
+
+
+def main() -> None:
+    args = parse_args()
+    wall_start = time.time()
+    out_dir = os.path.abspath(args.out_dir)
+    dst_graphsage = os.path.join(out_dir, "graphsage_runs")
+    dst_processed = os.path.join(out_dir, "Sharding", "processed")
+    log_path = os.path.join(out_dir, "logs", "unlearn_log.txt")
+
+    def log(msg: str) -> None:
+        ts = time.strftime("%H:%M:%S")
+        line = f"[{ts}] {msg}"
+        print(line, flush=True)
+        append_log(log_path, line)
+
+    log("=" * 60)
+    log(f"RETRY UNLEARN RETRAIN  out_dir={relpath_for_log(out_dir)}")
+
+    shard_ids = args.shard_ids if args.shard_ids else _detect_pending_shards(dst_graphsage)
+    if not shard_ids:
+        log("[RETRY] no shards to retry (all done).")
+    else:
+        log(f"[RETRY] retrying {len(shard_ids)} shards: {shard_ids}")
+        results = retrain_shards_parallel(
+            dst_graphsage, dst_processed, shard_ids, args.num_gpus, log
+        )
+        failed = [k for k, ok in results.items() if not ok]
+        if failed:
+            log(f"[ERROR] still failing after retry: {failed}")
+            sys.exit(1)
+        log("[RETRY] all retried shards succeeded.")
+
+    eval_results = None
+    if not args.skip_eval:
+        state_dir = _parse_state_dir(log_path)
+        eval_data_dir = _resolve_eval_data_dir(state_dir, args.eval_data_dir)
+        cfg = load_config(os.path.join(state_dir, "config_used.yaml"))
+        eval_results = run_eval(
+            out_dir, eval_data_dir, args.num_gpus, log,
+            cfg=cfg, sharding_dir=os.path.join(out_dir, "Sharding"),
+        )
+
+    forget_request = _parse_forget_request(log_path)
+    wall_time = round(time.time() - wall_start, 1)
+    results_path = os.path.join(out_dir, "results_unlearn.json")
+    payload = {
+        "experiment_type": f"graphsage_{forget_request['forget_type']}_unlearn",
+        "out_dir": out_dir,
+        "wall_time_s": wall_time,
+        "forget_request": forget_request,
+        "eval": eval_results,
+        "note": "result regenerated by retry.py after retrying failed shards",
+    }
+    with open(results_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, default=str)
+
+    log("=" * 60)
+    log(f"RETRY COMPLETE  wall={wall_time:.1f}s")
+    if eval_results:
+        r = eval_results.get("routable", {})
+        log(f"  [routable] ACC@1={r.get('acc@1', '?')}  MRR={r.get('mrr', '?')}")
+    log(f"  results → {relpath_for_log(results_path)}")
+    log("=" * 60)
+
+
+if __name__ == "__main__":
+    main()

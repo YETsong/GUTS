@@ -1,3 +1,26 @@
+# Data (raw/processed data and symlinks point to local absolute paths, so they are not committed)
+*.csv
+*.pickle
+*.pkl
+*.h5
+*.pt
+*.png
+
+# Folders
+# Commit only the processed/ directory structure (.gitkeep); exclude the data and symlinks inside
+/processed/**
+!/processed/**/
+!/processed/**/.gitkeep
+/raw
+**/runs
+**/shard-runs
+**/shard-unlearns
+**/shard-retrains
+/Results
+
+# Package markers are not needed (namespace packages)
+__init__.py
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -216,3 +239,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Data for the Analysis figures
+Analysis/figure_*/**
+
+# README images
+!assets/*.png
