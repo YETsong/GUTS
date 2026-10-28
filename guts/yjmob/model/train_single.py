@@ -21,16 +21,14 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from guts.yjmob.model.trainer import SingleProcess, build_arg_parser, run_training
+from guts.yjmob.model.trainer import SingleProcess, build_arg_parser, run_training, summary_line
 
 
 def main() -> None:
     args = build_arg_parser("GraphSAGE + GRU next-grid training (single process).").parse_args()
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    # Shards train in parallel, one process per GPU: label logs by the physical GPU and
-    # let only the process on GPU 0 echo to stdout.
-    log_label = int(os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0])
-    run_training(args, SingleProcess(device), log_label=log_label)
+    results = run_training(args, SingleProcess(device))
+    print(summary_line(results), flush=True)
 
 
 if __name__ == "__main__":

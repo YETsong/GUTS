@@ -17,7 +17,7 @@ from typing import Dict, List, Tuple
 
 import torch
 
-from guts.utils import ensure_dir
+from guts.method.utils import ensure_dir, repo_relpath
 
 
 def build_edge_weight_map(sample) -> Dict[Tuple[int, int], float] | None:
@@ -136,12 +136,9 @@ class _ShardSequenceWriter:
         }
 
 
-def _iter_source_sessions(source_dir: str, parts: List[dict], days: set, log, tag: str):
+def _iter_source_sessions(source_dir: str, parts: List[dict], days: set):
     """Yield the source sessions of `days` from the given sequence parts."""
-    log(f"  {tag} start  total_parts={len(parts)}")
-    for part_i, part in enumerate(parts):
-        if part_i % 10 == 0 and part_i > 0:
-            log(f"  {tag} part {part_i}/{len(parts)}")
+    for part in parts:
         for sess in torch.load(os.path.join(source_dir, part["path"]), map_location="cpu"):
             if int(sess["day"]) in days:
                 yield sess
@@ -158,7 +155,6 @@ def build_sequences(
     max_sessions_per_part: int,
     max_source_parts: int,
     log_fn=None,
-    day_tag: str = "",
 ) -> Dict[int, dict]:
     """Split every source session of `days` into per-shard segments (by that day's
     partition) and write the segments of `shard_ids` as sequence parts; returns their
@@ -176,12 +172,14 @@ def build_sequences(
 
     shard_set = set(shard_ids)
     writer = _ShardSequenceWriter(out_dir, max_sessions_per_part)
+    done = []
     for split in splits:
         parts = source_meta["sequence_index"][split]["parts"]
         if max_source_parts > 0:
             parts = parts[:max_source_parts]
-        tag = f"[{day_tag}/Seq/{split}]" if day_tag else f"[Seq/{split}]"
-        for sess in _iter_source_sessions(source_dir, parts, days, log, tag):
+        n_sessions = 0
+        for sess in _iter_source_sessions(source_dir, parts, days):
+            n_sessions += 1
             day = int(sess["day"])
             segment_count: Dict[int, int] = defaultdict(int)
             for shard_id, segment in split_session_by_shard(sess["cells"], shard_of_by_day[day]):
@@ -197,6 +195,8 @@ def build_sequences(
                     "cells": segment,
                 })
                 segment_count[shard_id] += 1
+        done.append(f"{split} {n_sessions:,}")
+    log(f"  sessions split  {'  '.join(done)}  -> {len(shard_ids)} shards written")
     return writer.finish(shard_ids, splits)
 
 
@@ -260,7 +260,6 @@ def materialize_graphsage_shards(
     if shard_ids is None:
         shard_ids = sorted(next(iter(by_day.values()))["shards"])
     shard_ids = sorted(int(k) for k in shard_ids)
-    day_tag = f"D{days[0]}" if len(days) == 1 else f"D{min(days)}-{max(days)}"
     seq_index = build_sequences(
         source_dir=source_processed_dir,
         out_dir=out_dir,
@@ -272,11 +271,10 @@ def materialize_graphsage_shards(
         max_sessions_per_part=max_sessions_per_part,
         max_source_parts=max_source_parts,
         log_fn=log_fn,
-        day_tag=day_tag,
     )
     write_outputs(out_dir, source_processed_dir, source_meta, by_day, shard_ids, seq_index)
     return {
-        "out_dir": os.path.abspath(out_dir),
+        "out_dir": repo_relpath(out_dir),
         "num_shards": len(shard_ids),
         "shards": {
             int(shard_id): {
@@ -287,3 +285,25 @@ def materialize_graphsage_shards(
             for shard_id in shard_ids
         },
     }
+
+
+def estimate_shard_weight(processed_dir: str) -> int:
+    """Training load of a shard for GPU balancing: its day-graph edges (else train steps or
+    sessions); 1 when the shard has no meta yet."""
+    meta_path = os.path.join(processed_dir, "next_location_meta.pt")
+    if not os.path.exists(meta_path):
+        return 1
+    meta = torch.load(meta_path, map_location="cpu")
+    daily_graphs = meta.get("daily_graphs")
+    if daily_graphs:
+        total_edges = sum(int(entry.get("num_edges", 0)) for entry in daily_graphs)
+        if total_edges:
+            return int(total_edges)
+    counts = meta.get("counts", {})
+    steps = counts.get("split_steps", {}).get("train")
+    if steps:
+        return int(steps)
+    sessions = counts.get("split_sessions", {}).get("train")
+    if sessions:
+        return int(sessions)
+    return 1

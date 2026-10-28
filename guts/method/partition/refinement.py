@@ -42,7 +42,7 @@ class BoundaryRefiner:
     def __init__(
         self,
         pcfg,
-        pc,
+        tc,
         edge_index: torch.Tensor,
         hyperedges: List[List[int]],
         local_to_global: List[int],
@@ -112,15 +112,15 @@ class BoundaryRefiner:
         self.counts_before = self.shard_node_counts.copy()
         self.cap = int(np.ceil(len(self.node_to_shard) / K * (1.0 + refine_epsilon)))
 
-        # Users of each node and the shards each user's paths touch (destination shortlist).
+        # Users of each node and the shards each user's trajs touch (destination shortlist).
         self.uid_to_shards: Dict[int, Set[int]] = defaultdict(set)
         self.node_uids: Dict[int, Set[int]] = defaultdict(set)
-        for path, uid in zip(pc.paths, pc.path_uids):
+        for traj, uid in zip(tc.trajs, tc.traj_uids):
             if uid is None:
                 continue
-            path_shards = {self.node_to_shard[int(n)] for n in path if int(n) in self.node_to_shard}
-            self.uid_to_shards[uid] |= path_shards
-            for n in path:
+            traj_shards = {self.node_to_shard[int(n)] for n in traj if int(n) in self.node_to_shard}
+            self.uid_to_shards[uid] |= traj_shards
+            for n in traj:
                 self.node_uids[int(n)].add(uid)
 
         self._init_labels(node_labels)
@@ -228,7 +228,7 @@ class BoundaryRefiner:
         return self.neighbor_shard_count.get(v, {}).get(shard_id, 0)
 
     def dest_candidates(self, v: int) -> Set[int]:
-        """Shards of v's neighbours, of its hyperedges and of its users' paths."""
+        """Shards of v's neighbours, of its hyperedges and of its users' trajs."""
         cur = self.node_to_shard[v]
         cands: Set[int] = set()
         for u in self.node_incident.get(v, ()):

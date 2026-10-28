@@ -13,7 +13,7 @@ Each day graph is partitioned in four stages (paper §4.1-§4.4):
   3. Boundary Refinement (§4.3, refinement.py) — boundary nodes with the largest
      positive gain are moved (single moves, then pairwise swaps) to reduce KM1 and
      cross-shard transitions, optionally with a label-distribution term, under the
-     shard-size imbalance refine_epsilon (0.05, the same as KaHyPar's epsilon).
+     shard-size imbalance refine_epsilon.
   4. Temporal Subgraph Assignment (§4.4, assignment.py) — the day's subgraphs are matched to
      persistent shard models by Hungarian matching on node/spatial/user
      similarity. The reference descriptors are instance state kept across fit()
@@ -22,7 +22,10 @@ Each day graph is partitioned in four stages (paper §4.1-§4.4):
 
 from __future__ import annotations
 
+import contextlib
+import ctypes
 import os
+import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -31,13 +34,11 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
 import torch
 
-from guts.partition.assignment import TemporalSubgraphAssigner, load_grid_info
-from guts.partition.refinement import BoundaryRefiner
-from guts.partition.trajectory_paths import (
-    TrajectoryPathExtractor,
-    TrajectoryPaths,
-)
-from guts.shard import build_shard_edges
+from guts.method.partition.assignment import TemporalSubgraphAssigner
+from guts.method.partition.refinement import BoundaryRefiner
+from guts.method.partition.trajectories import Trajectories
+from guts.method.shard import build_shard_edges
+from guts.method.utils import relpath_for_log
 
 import kahypar as _kahypar
 
@@ -48,6 +49,27 @@ import kahypar as _kahypar
 
 # Hyperedge weight range: w(e) = 1 + round(KAPPA * q(e)) in {1, ..., 10} (Eq. 23).
 KAPPA = 9
+
+_LIBC = ctypes.CDLL(None)
+
+
+@contextlib.contextmanager
+def _native_stdout_to_devnull():
+    """Discard what native code writes to stdout (fd 1) inside the block.
+
+    KaHyPar prints "No improvement in V-cycle ..." even with suppressOutput(True) and quiet=1.
+    """
+    sys.stdout.flush()
+    saved_fd = os.dup(1)
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull_fd, 1)
+        yield
+    finally:
+        _LIBC.fflush(None)
+        os.dup2(saved_fd, 1)
+        os.close(saved_fd)
+        os.close(devnull_fd)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -148,32 +170,43 @@ class GUTSPartitioner:
     Output fields are compatible with ShardBuilder and the unlearning index.
     """
 
-    def __init__(self, cfg) -> None:
-        self.cfg = cfg
-        self.pcfg = cfg.partition
-        self._trajectory_extractor = TrajectoryPathExtractor(cfg)
+    def __init__(
+        self,
+        pcfg,
+        seed: int,
+        window_size: int = 1,
+        grid_info: Optional[Dict[str, int]] = None,
+    ) -> None:
+        """pcfg: PartitionConfig. seed: KaHyPar seed. window_size, grid_info: §4.4 reference
+        window (days) and grid origin/height for spatial centroids (None: no grid)."""
+        self.pcfg = pcfg
+        self.seed = int(seed)
 
-        # §4.4 state persists across fit() calls for successive days
-        # (guts/yjmob/pipeline.py builds one partitioner per run).
-        self._assigner = TemporalSubgraphAssigner(
-            window_size=cfg.temporal_graph.window_size,
-            grid_info=load_grid_info(cfg.data.nextgrid_processed_dir),
-        )
+        # §4.4 state persists across subgraph_assign() calls for successive days,
+        # so one partitioner instance must see the days in order.
+        self._assigner = TemporalSubgraphAssigner(window_size=window_size, grid_info=grid_info)
 
     # ──────────────────────────────────────────────────────────────────────
     # Public API
     # ──────────────────────────────────────────────────────────────────────
 
-    def fit(self, sample, node_labels: Optional[np.ndarray] = None) -> GUTSPartition:
-        partition, pc = self.fit_unassigned(sample, node_labels)
-        return self.subgraph_assign(partition, pc)
+    def fit(
+        self, sample, tc: Trajectories, node_labels: Optional[np.ndarray] = None
+    ) -> GUTSPartition:
+        partition, tc = self.fit_unassigned(sample, tc, node_labels)
+        return self.subgraph_assign(partition, tc)
 
     def fit_unassigned(
-        self, sample, node_labels: Optional[np.ndarray] = None
-    ) -> Tuple[GUTSPartition, TrajectoryPaths]:
+        self, sample, tc: Trajectories, node_labels: Optional[np.ndarray] = None
+    ) -> Tuple[GUTSPartition, Trajectories]:
+        """Partition one graph (§4.1-§4.3).
+
+        sample: graph with `edge_index` and `num_nodes`. tc: its trajectories (hyperedges);
+        trajs with fewer than two points or nodes outside the graph are dropped.
+        Returns the partition and the trajectories actually used."""
         K = int(self.pcfg.num_shards)
         epsilon = float(self.pcfg.epsilon)
-        seed = int(self.cfg.training.seed)
+        seed = self.seed
         label_array: Optional[np.ndarray] = None
         if node_labels is not None:
             if torch.is_tensor(node_labels):
@@ -187,16 +220,16 @@ class GUTSPartitioner:
                     f"got {len(label_array)}, expected at least {sample.num_nodes}"
                 )
 
-        pc = self._extract_paths(sample)
+        tc = tc.filter_to(int(sample.num_nodes))
         active_nodes = self._active_nodes(sample)
 
         # §4.1: Deletion Influence Modeling
         di = self._compute_deletion_influence_scores(
-            pc, active_nodes, sample.edge_index, int(sample.num_nodes), node_labels=label_array
+            tc, active_nodes, sample.edge_index, int(sample.num_nodes), node_labels=label_array
         )
 
         # §4.2: Trajectory Hypergraph Partitioning (DI-weighted hyperedges + KaHyPar)
-        local_to_global, hyperedges = self._build_hyperedges(pc, active_nodes)
+        local_to_global, hyperedges = self._build_hyperedges(tc, active_nodes)
         hyperedge_weights = self._build_hyperedge_weights(
             hyperedges, di, local_to_global, use_di_weighting=bool(self.pcfg.use_di)
         )
@@ -232,13 +265,13 @@ class GUTSPartitioner:
             int(pre_refine_counts.max()) if pre_refine_counts.size else 0
         )
 
-        # §4.3: Boundary Refinement (guts/partition/refinement.py)
-        before_refine = self._quality_metrics(pc, node_to_shard, sample.edge_index, K, label_array)
+        # §4.3: Boundary Refinement (guts/method/partition/refinement.py)
+        before_refine = self._quality_metrics(tc, node_to_shard, sample.edge_index, K, label_array)
         refine_stats: Dict[str, Any] = {}
         if self.pcfg.use_boundary_refinement:
             refine_started = time.perf_counter()
             node_to_shard, refine_stats = BoundaryRefiner(
-                self.pcfg, pc, sample.edge_index, hyperedges, local_to_global,
+                self.pcfg, tc, sample.edge_index, hyperedges, local_to_global,
                 node_to_shard, di, K, label_array,
             ).run()
             refine_stats["pre_refine_max_shard_size"] = pre_refine_max_shard_size
@@ -247,7 +280,7 @@ class GUTSPartitioner:
         shards_nodes = self._build_shards_nodes(node_to_shard, K)
         shards_edges = build_shard_edges(sample.edge_index, shards_nodes, sample.num_nodes)
 
-        quality_metrics = self._quality_metrics(pc, node_to_shard, sample.edge_index, K, label_array)
+        quality_metrics = self._quality_metrics(tc, node_to_shard, sample.edge_index, K, label_array)
         for key, value in refine_stats.items():
             if isinstance(value, (float, np.floating)):
                 value = round(float(value), 6)
@@ -262,28 +295,17 @@ class GUTSPartitioner:
             node_to_shard=node_to_shard,
             quality_metrics=quality_metrics,
         )
-        return partition, pc
+        return partition, tc
 
-    def subgraph_assign(self, partition: GUTSPartition, pc: TrajectoryPaths) -> GUTSPartition:
-        """§4.4 (guts/partition/assignment.py); days must be passed in order."""
+    def subgraph_assign(self, partition: GUTSPartition, tc: Trajectories) -> GUTSPartition:
+        """§4.4 (guts/method/partition/assignment.py); days must be passed in order."""
         if self.pcfg.use_temporal_subgraph_assignment:
-            partition = self._assigner.assign(partition, pc)
+            partition = self._assigner.assign(partition, tc)
         return partition
 
-    def save(self, partition: GUTSPartition, path: str) -> None:
-        from guts.utils import save_pickle
-        save_pickle(partition, path)
-
-    def load(self, path: str) -> GUTSPartition:
-        from guts.utils import load_pickle
-        return load_pickle(path)
-
     # ──────────────────────────────────────────────────────────────────────
-    # Path extraction
+    # Graph helpers
     # ──────────────────────────────────────────────────────────────────────
-
-    def _extract_paths(self, sample) -> TrajectoryPaths:
-        return self._trajectory_extractor.extract(sample).filter_to(int(sample.num_nodes))
 
     @staticmethod
     def _active_nodes(sample) -> Set[int]:
@@ -298,11 +320,11 @@ class GUTSPartitioner:
     # ──────────────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _compute_tf(pc: TrajectoryPaths, active_nodes: Set[int], num_nodes: int) -> np.ndarray:
-        """TF(v) (Eq. 14): number of path transitions incident to v."""
+    def _compute_tf(tc: Trajectories, active_nodes: Set[int], num_nodes: int) -> np.ndarray:
+        """TF(v) (Eq. 14): number of traj transitions incident to v."""
         tf: Dict[int, int] = defaultdict(int)
-        for path in pc.paths:
-            for src, dst in zip(path, path[1:]):
+        for traj in tc.trajs:
+            for src, dst in zip(traj, traj[1:]):
                 src, dst = int(src), int(dst)
                 if src in active_nodes:
                     tf[src] += 1
@@ -314,14 +336,14 @@ class GUTSPartitioner:
         return out
 
     @staticmethod
-    def _compute_uc_star(pc: TrajectoryPaths, active_nodes: Set[int], num_nodes: int) -> np.ndarray:
+    def _compute_uc_star(tc: Trajectories, active_nodes: Set[int], num_nodes: int) -> np.ndarray:
         """UC*(v) (Eq. 15-16): probability that two visits to v drawn without replacement
         come from the same user, sum_u c_u(c_u - 1) / (T(T - 1))."""
         user_visits: Dict[int, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
-        for path, uid in zip(pc.paths, pc.path_uids):
+        for traj, uid in zip(tc.trajs, tc.traj_uids):
             if uid is None:
                 continue
-            for v in path:
+            for v in traj:
                 v = int(v)
                 if v in active_nodes:
                     user_visits[v][int(uid)] += 1
@@ -370,7 +392,7 @@ class GUTSPartitioner:
 
     def _compute_deletion_influence_scores(
         self,
-        pc: TrajectoryPaths,
+        tc: Trajectories,
         active_nodes: Set[int],
         edge_index: torch.Tensor,
         num_nodes: int,
@@ -388,9 +410,9 @@ class GUTSPartitioner:
 
         di = np.zeros(num_nodes, dtype=np.float32)
         if alpha:
-            di = di + alpha * self._normalise(self._compute_tf(pc, active_nodes, num_nodes))
+            di = di + alpha * self._normalise(self._compute_tf(tc, active_nodes, num_nodes))
         if beta:
-            di = di + beta * self._normalise(self._compute_uc_star(pc, active_nodes, num_nodes))
+            di = di + beta * self._normalise(self._compute_uc_star(tc, active_nodes, num_nodes))
         if gamma:
             di = di + gamma * self._normalise(self._compute_ch(node_labels, edge_index, num_nodes))
         if alpha_static:
@@ -403,10 +425,10 @@ class GUTSPartitioner:
 
     def _build_hyperedges(
         self,
-        pc: TrajectoryPaths,
+        tc: Trajectories,
         active_nodes: Set[int],
     ) -> Tuple[List[int], List[List[int]]]:
-        """Map active nodes to local vertex ids 0..n-1 and turn each path with at least
+        """Map active nodes to local vertex ids 0..n-1 and turn each traj with at least
         two distinct active nodes into a hyperedge (Eq. 21). Every active node is a vertex, so
         KaHyPar assigns all of them (nodes in no hyperedge are placed freely)."""
         global_to_local: Dict[int, int] = {}
@@ -417,9 +439,9 @@ class GUTSPartitioner:
             local_to_global.append(int(node))
 
         hyperedges: List[List[int]] = []
-        for path in pc.paths:
+        for traj in tc.trajs:
             local_ids = list(dict.fromkeys(
-                global_to_local[int(n)] for n in path
+                global_to_local[int(n)] for n in traj
                 if int(n) in global_to_local
             ))
             if len(local_ids) >= 2:
@@ -494,14 +516,15 @@ class GUTSPartitioner:
         context = _kahypar.Context()
         ini_path = os.path.join(os.path.dirname(__file__), "kahypar_km1_initial_only.ini")
         if not os.path.exists(ini_path):
-            raise FileNotFoundError(f"KaHyPar INI config not found: {ini_path}")
+            raise FileNotFoundError(f"KaHyPar INI config not found: {relpath_for_log(ini_path)}")
         context.loadINIconfiguration(ini_path)
         context.setK(K)
         context.setEpsilon(epsilon)
         context.setSeed(seed)
         context.suppressOutput(True)
 
-        _kahypar.partition(hypergraph, context)
+        with _native_stdout_to_devnull():
+            _kahypar.partition(hypergraph, context)
 
         node_to_local_shard: Dict[int, int] = {
             i: int(hypergraph.blockID(i)) for i in range(num_vertices)
@@ -531,7 +554,7 @@ class GUTSPartitioner:
 
     @staticmethod
     def _quality_metrics(
-        pc: TrajectoryPaths,
+        tc: Trajectories,
         node_to_shard: Dict[int, int],
         edge_index: torch.Tensor,
         K: int,
@@ -540,8 +563,8 @@ class GUTSPartitioner:
         """Partition quality, chosen by whether the graph has node labels.
 
         Trajectory graphs (no labels) — the two measures reported in the paper (Sec. 6):
-          shards_per_path: mean connectivity lambda_e of the path hyperedges (Eq. 11),
-                           i.e. the mean number of shards a path spans.
+          shards_per_traj: mean connectivity lambda_e of the traj hyperedges (Eq. 11),
+                           i.e. the mean number of shards a traj spans.
           cstr           : share of graph edges (transitions) whose endpoints lie in
                            different shards (an unassigned endpoint counts as different).
         Static node-classification graphs (labels):
@@ -554,10 +577,10 @@ class GUTSPartitioner:
             return GUTSPartitioner._label_quality_metrics(node_to_shard, K, node_labels)
 
         touched_counts = [
-            len({node_to_shard[int(n)] for n in path if int(n) in node_to_shard})
-            for path in pc.paths
+            len({node_to_shard[int(n)] for n in traj if int(n) in node_to_shard})
+            for traj in tc.trajs
         ]
-        shards_per_path = float(np.mean(touched_counts)) if touched_counts else 0.0
+        shards_per_traj = float(np.mean(touched_counts)) if touched_counts else 0.0
 
         src = edge_index[0].cpu().numpy().astype(np.int64)
         dst = edge_index[1].cpu().numpy().astype(np.int64)
@@ -572,7 +595,7 @@ class GUTSPartitioner:
             cstr = cross / len(src)
 
         return {
-            "shards_per_path": round(shards_per_path, 6),
+            "shards_per_traj": round(shards_per_traj, 6),
             "cstr": round(float(cstr), 6),
         }
 
@@ -603,10 +626,3 @@ class GUTSPartitioner:
             table[nonempty] / shard_sizes[nonempty, None] - global_dist
         ).sum(axis=1)
         return {"balance": round(balance, 6), "fairness": round(float(tv.mean()), 6)}
-
-def make_partitioner(cfg):
-    """Return the partitioner selected by cfg.partition.strategy."""
-    strategy = cfg.partition.strategy
-    if strategy == "guts":
-        return GUTSPartitioner(cfg)
-    raise ValueError(f"Unknown partition.strategy: {strategy}")

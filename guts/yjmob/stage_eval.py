@@ -3,6 +3,7 @@
 Each test step of day d is sent to one shard (majority vote over the partitions
 of the training days before d) and predicted by that shard's model from its
 rolling graph of d. Also used by the unlearning scripts to evaluate unlearned runs.
+Writes its log to the given eval log file only; callers print the result.
 """
 
 from __future__ import annotations
@@ -28,9 +29,11 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
 
-from guts.utils import append_log_synced, relpath_for_log
+from guts.method.reporting import format_metrics
+from guts.method.utils import append_log_synced, relpath_for_log
 from guts.yjmob.model.dataset import local_graph
 from guts.yjmob.model.model import NextGridPredictor
+from guts.yjmob.model.trainer import target_ranks
 
 
 def _gs_load_shard(shard_run_dir: str, processed_dir: str, device: torch.device, window_size: int) -> Dict:
@@ -60,13 +63,13 @@ def _gs_load_shard(shard_run_dir: str, processed_dir: str, device: torch.device,
     if not os.path.exists(ckpt_path):
         ckpt_path = os.path.join(ckpt_dir, "shard_run_best.pt")
     if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(f"no best.pt or shard_run_best.pt in {ckpt_dir}")
+        raise FileNotFoundError(f"no best.pt or shard_run_best.pt in {relpath_for_log(ckpt_dir)}")
     model.load_state_dict(torch.load(ckpt_path, map_location="cpu")["model_state"])
     model.to(device).eval()
 
     rolling_graph_dir = os.path.join(processed_dir, f"rolling_graphs_w{int(window_size)}")
     if not os.path.isdir(rolling_graph_dir):
-        raise FileNotFoundError(f"rolling graphs not found: {rolling_graph_dir}")
+        raise FileNotFoundError(f"rolling graphs not found: {relpath_for_log(rolling_graph_dir)}")
     return {
         "model": model,
         "device": device,
@@ -102,19 +105,18 @@ def _gs_get_rolling_graph_z(shard: Dict, target_day: int, window_size: int) -> T
 
 
 @torch.no_grad()
-def _infer_large_batch_topk(
+def _infer_target_ranks(
     model,
     graph_z: torch.Tensor,
     node_lookup: torch.Tensor,
     segments: List[List[int]],
+    targets: np.ndarray,
     device: torch.device,
     infer_batch: int = 1024,
-    topk: int = 100,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> np.ndarray:
+    """Rank of each step's target over all cells (float32 logits, same rule as training)."""
     n = len(segments)
-    k_actual = min(topk, model.num_nodes)
-    all_top_ids  = np.empty((n, k_actual), dtype=np.int32)
-    all_top_vals = np.empty((n, k_actual), dtype=np.float16)
+    ranks = np.empty(n, dtype=np.int64)
 
     for start in range(0, n, infer_batch):
         batch_segs = segments[start:start + infer_batch]
@@ -131,29 +133,28 @@ def _infer_large_batch_topk(
         last_idxs = (lengths - 1).to(device)
         last_cells = padded[rows, last_idxs]
         h = out[rows, last_idxs] + model.sage_beta * model.graph_embeddings_for_inputs(graph_z, last_cells, node_lookup)
-        probs = torch.softmax(model.logits(h), dim=1)
-        top_vals, top_ids = torch.topk(probs, k=k_actual, dim=1)
-        all_top_ids[start:start + B]  = top_ids.cpu().numpy().astype(np.int32)
-        all_top_vals[start:start + B] = top_vals.cpu().float().numpy().astype(np.float16)
+        logits = model.logits(h).float()
+        tgt = torch.as_tensor(targets[start:start + B], dtype=torch.long, device=device)
+        ranks[start:start + B] = target_ranks(logits, tgt).long().cpu().numpy()
 
-    return all_top_ids, all_top_vals
+    return ranks
 
 
 def _sequence_part_paths(processed_dir: str, split: str) -> Tuple[List[str], dict, int]:
     """Sequence parts registered in the processed dataset metadata, the split index, and num_nodes."""
     meta_path = os.path.join(os.path.abspath(processed_dir), "next_location_meta.pt")
     if not os.path.exists(meta_path):
-        raise FileNotFoundError(f"next_location_meta.pt not found: {meta_path}")
+        raise FileNotFoundError(f"next_location_meta.pt not found: {relpath_for_log(meta_path)}")
     meta = torch.load(meta_path, map_location="cpu")
     split_meta = meta.get("sequence_index", {}).get(split)
     if not split_meta or not split_meta.get("parts"):
-        raise ValueError(f"sequence_index[{split!r}] is empty: {meta_path}")
+        raise ValueError(f"sequence_index[{split!r}] is empty: {relpath_for_log(meta_path)}")
 
     paths = []
     for part in split_meta["parts"]:
         path = os.path.join(os.path.abspath(processed_dir), part["path"])
         if not os.path.exists(path):
-            raise FileNotFoundError(f"registered sequence part not found: {path}")
+            raise FileNotFoundError(f"registered sequence part not found: {relpath_for_log(path)}")
         paths.append(path)
     return paths, split_meta, int(meta["num_nodes"])
 
@@ -174,7 +175,7 @@ def _build_shard_routing_by_day(sharding_dir: str, eval_days: List[int]) -> Dict
     for path in glob.glob(os.path.join(sharding_dir, "partition", "day*.pkl")):
         day_pkls[int(os.path.basename(path)[len("day"):-len(".pkl")])] = path
     if not day_pkls:
-        raise FileNotFoundError(f"no partition/day*.pkl under {sharding_dir}")
+        raise FileNotFoundError(f"no partition/day*.pkl under {relpath_for_log(sharding_dir)}")
 
     votes: Dict[int, Dict[int, List[int]]] = defaultdict(dict)  # node -> shard -> [count, last day]
     routes: Dict[int, Dict[int, int]] = {}
@@ -197,7 +198,7 @@ def _build_shard_routing_by_day(sharding_dir: str, eval_days: List[int]) -> Dict
     return routes
 
 
-def _agg_eval_rolling_worker(rank: int, world_size: int, worker_args: dict) -> None:
+def _eval_worker(rank: int, world_size: int, worker_args: dict) -> None:
     cuda_dev = worker_args["cuda_devices"][rank]
     torch.cuda.set_device(cuda_dev)
     torch.backends.cudnn.benchmark = False
@@ -211,24 +212,17 @@ def _agg_eval_rolling_worker(rank: int, world_size: int, worker_args: dict) -> N
     routes          = worker_args["routes"]  # {day: {global_node_id: shard_id}}
     result_path     = worker_args["result_paths"][rank]
     infer_batch     = worker_args["infer_batch"]
-    topk            = worker_args["topk"]
     log_path        = worker_args["log_path"]
 
     tag = f"[GPU{cuda_dev}]"
-    is_main = (rank == 0)
 
     def log_w(msg: str) -> None:
         ts = datetime.now().strftime("%H:%M:%S")
         line = f"[{ts}] {tag} {msg}"
-        if is_main:
-            print(line, flush=True)
         if log_path:
             append_log_synced(log_path, line)
 
-    log_w("=" * 50)
-    log_w(f"[AGG EVAL ROLLING] rank={rank}/{world_size}  split={split}  window={window_size}"
-          f"  (shard routing + rolling graph)")
-    log_w("=" * 50)
+    log_w(f"worker {rank + 1}/{world_size}  split={split}  window={window_size}")
 
     all_sessions_flat: List[Tuple[List[int], int]] = []
     for part_path in worker_args["part_paths"]:
@@ -239,7 +233,7 @@ def _agg_eval_rolling_worker(rank: int, world_size: int, worker_args: dict) -> N
             if len(cells) >= 2 and day >= window_size:
                 all_sessions_flat.append((cells, day))
     my_sessions = all_sessions_flat[rank::world_size]
-    log_w(f"  sessions={len(my_sessions):,} (after day>={window_size} filter)")
+    log_w(f"  sessions {len(my_sessions):,} (day >= {window_size})")
 
     all_steps: List[Tuple[List[int], int, int, int]] = []  # (cells, t, target, day)
     step_shard: List[Optional[int]] = []
@@ -257,7 +251,7 @@ def _agg_eval_rolling_worker(rank: int, world_size: int, worker_args: dict) -> N
     N = len(all_steps)
     n_routable = sum(1 for k in step_shard if k is not None)
     n_unroutable = N - n_routable
-    log_w(f"  steps={N:,}  routable={n_routable:,}  unroutable={n_unroutable:,}  skipped={n_skipped}")
+    log_w(f"  steps {N:,}  routable {n_routable:,}  unroutable {n_unroutable:,}  skipped {n_skipped:,}")
 
     shard_day_to_steps: Dict[Tuple[int, int], List[int]] = defaultdict(list)
     for idx, k in enumerate(step_shard):
@@ -267,13 +261,12 @@ def _agg_eval_rolling_worker(rank: int, world_size: int, worker_args: dict) -> N
     cpu_device = torch.device("cpu")
     t_infer = time.time()
     shard_keys = sorted({k for (k, _d) in shard_day_to_steps})
-    log_w(f"--- Inference + aggregation  "
-          f"({len(shard_keys)} shard(s), {len(shard_day_to_steps)} (shard,day) group(s)) ---")
+    log_w(f"  inference  {len(shard_keys)} shards  {len(shard_day_to_steps)} (shard, day) groups")
+    marks = {max(1, round(len(shard_keys) * q / 4)) for q in (1, 2, 3)}
 
     r_acc = {1: 0, 5: 0, 10: 0}; r_rr = 0.0; r_steps = 0
     n_out_of_graph = 0  # evaluated steps whose input cell is absent from the shard's rolling graph (z = 0)
-    groups_done = 0
-    for k in shard_keys:
+    for shard_i, k in enumerate(shard_keys, start=1):
         sd = _gs_load_shard(
             os.path.join(gs_dir, f"shard_{k}"), os.path.join(processed_base, f"shard_{k}"),
             cpu_device, window_size,
@@ -288,33 +281,25 @@ def _agg_eval_rolling_worker(rank: int, world_size: int, worker_args: dict) -> N
             targets = [all_steps[idx][2] for idx in step_indices]
             last_cells = torch.tensor([seg[-1] for seg in segments], dtype=torch.long, device=device)
             n_out_of_graph += int((node_lookup[last_cells] < 0).sum().item())
-            top_k_ids, top_k_vals = _infer_large_batch_topk(
-                sd["model"], graph_z, node_lookup, segments, device, infer_batch=infer_batch, topk=topk,
-            )
             targets = np.array(targets, dtype=np.int64)
-            vals = top_k_vals.astype(np.float32)
-            ids  = top_k_ids.astype(np.int64)
-
-            matches = (ids == targets[:, None])
-            has_match = matches.any(axis=1)
-            target_val = np.where(has_match, (vals * matches).sum(axis=1), 0.0)
-            rank = 1 + (vals > target_val[:, None]).sum(axis=1)
+            rank = _infer_target_ranks(
+                sd["model"], graph_z, node_lookup, segments, targets, device, infer_batch=infer_batch,
+            )
 
             for kv in (1, 5, 10):
                 r_acc[kv] += int((rank <= kv).sum())
             r_rr += float((1.0 / rank).sum())
             r_steps += len(step_indices)
-            groups_done += 1
 
         sd["model"].cpu()
         del sd
         torch.cuda.empty_cache()
-        if groups_done and groups_done % 20 == 0:
-            log_w(f"  groups={groups_done}  r_steps={r_steps:,}  elapsed={time.time() - t_infer:.0f}s")
+        if shard_i in marks:
+            log_w(f"  {shard_i}/{len(shard_keys)} shards  {r_steps:,} steps  {time.time() - t_infer:.0f}s")
 
     wall_s = time.time() - t_infer
-    log_w(f"--- done  wall={wall_s:.0f}s  r_steps={r_steps:,}  "
-          f"out_of_graph={n_out_of_graph:,} ({n_out_of_graph / max(r_steps, 1):.2%}) ---")
+    log_w(f"  done  {r_steps:,} steps  out of graph {n_out_of_graph:,} ({n_out_of_graph / max(r_steps, 1):.2%})"
+          f"  {wall_s:.0f}s")
 
     os.makedirs(os.path.dirname(result_path), exist_ok=True)
     torch.save({
@@ -322,14 +307,17 @@ def _agg_eval_rolling_worker(rank: int, world_size: int, worker_args: dict) -> N
         "n_routable": n_routable, "n_unroutable": n_unroutable, "n_skipped": n_skipped,
         "wall_s": wall_s,
     }, result_path)
-    log_w(f"  result saved -> {result_path}")
+
+
+def result_line(result: dict) -> str:
+    """'MRR ... ACC@10 ...  routable 99.97%' for a run_shard_routing_eval result."""
+    return f"{format_metrics(result['routable'])}  routable {100 * result['coverage']['routable_ratio']:.2f}%"
 
 
 def run_shard_routing_eval(
     run_dir: str,
     full_data_dir: str,
     eval_log_path: str,
-    log,
     window_size: int = 3,
     split: str = "test",
     device: Optional[torch.device] = None,
@@ -337,17 +325,20 @@ def run_shard_routing_eval(
     sharding_dir: Optional[str] = None,
 ) -> dict:
     """Shard routing evaluation of a trained run on ``split`` of ``full_data_dir``; see the section note above."""
+    def log(msg: str) -> None:  # eval log only
+        append_log_synced(eval_log_path, f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+
     _sharding_dir  = sharding_dir or os.path.join(run_dir, "Sharding")
     processed_base = os.path.join(_sharding_dir, "processed")
     if not os.path.isdir(processed_base):
-        raise FileNotFoundError(f"Sharding/processed/ not found: {processed_base}")
+        raise FileNotFoundError(f"Sharding/processed/ not found: {relpath_for_log(processed_base)}")
     available_shards = sorted(
         int(d.split("_", 1)[1])
         for d in os.listdir(processed_base)
         if d.startswith("shard_") and os.path.isdir(os.path.join(processed_base, d))
     )
     if not available_shards:
-        raise FileNotFoundError(f"no shard_* dirs in {processed_base}")
+        raise FileNotFoundError(f"no shard_* dirs in {relpath_for_log(processed_base)}")
 
     part_paths, split_meta, num_global = _sequence_part_paths(full_data_dir, split)
     total_sessions = 0
@@ -366,10 +357,11 @@ def run_shard_routing_eval(
         )
 
     routes = _build_shard_routing_by_day(_sharding_dir, sorted(eval_days))
-    log(f"  Shard routing: majority vote over the training days before each test day "
+    log(f"shard routing evaluation  run={relpath_for_log(run_dir)}  split={split}  window={window_size}"
+        f"  {len(available_shards)} shards  {total_sessions:,} sessions")
+    log(f"  routing: majority vote over the training days before each test day "
         f"({len(routes)} test days, up to {max((len(r) for r in routes.values()), default=0):,} routable nodes)")
-    log(f"  Rolling agg eval: {len(available_shards)} shards  {total_sessions:,} sessions"
-        f"  split={split}  window_size={window_size}  (shard routing + rolling graph)")
+    log(f"  rank: exact rank of the target over all {num_global:,} cells (float32 logits)")
 
     if device is None:
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -384,25 +376,24 @@ def run_shard_routing_eval(
         "routes":             routes,
         "log_path":           eval_log_path,
         "infer_batch":        1024,
-        "topk":               100,
     }
 
     import uuid as _uuid
     uid = _uuid.uuid4().hex[:8]
-    _scratch_root = os.path.join(run_dir, "_agg_eval_rolling_tmp")
+    _scratch_root = os.path.join(run_dir, "_eval_tmp")
     os.makedirs(_scratch_root, exist_ok=True)
 
     if num_gpus_eval > 1:
-        result_paths = [os.path.join(_scratch_root, f"agg_eval_rank{i}_{uid}.pt") for i in range(num_gpus_eval)]
+        result_paths = [os.path.join(_scratch_root, f"eval_rank{i}_{uid}.pt") for i in range(num_gpus_eval)]
         worker_args = dict(common_args, cuda_devices=list(range(num_gpus_eval)), result_paths=result_paths)
-        log(f"  Multi-GPU rolling agg eval: {num_gpus_eval} workers ...")
-        mp.spawn(_agg_eval_rolling_worker, args=(num_gpus_eval, worker_args), nprocs=num_gpus_eval, join=True)
+        log(f"  {num_gpus_eval} GPU workers")
+        mp.spawn(_eval_worker, args=(num_gpus_eval, worker_args), nprocs=num_gpus_eval, join=True)
     else:
         cuda_dev_sg = device.index if device.type == "cuda" and device.index is not None else 0
-        result_paths = [os.path.join(_scratch_root, f"agg_eval_rank0_{uid}.pt")]
+        result_paths = [os.path.join(_scratch_root, f"eval_rank0_{uid}.pt")]
         worker_args = dict(common_args, cuda_devices=[cuda_dev_sg], result_paths=result_paths)
-        log("  Single-GPU rolling agg eval ...")
-        _agg_eval_rolling_worker(0, 1, worker_args)
+        log("  1 GPU worker")
+        _eval_worker(0, 1, worker_args)
 
     r_acc_m = {1: 0, 5: 0, 10: 0}; r_rr_m = 0.0; r_steps_m = 0
     n_routable_m = 0; n_unroutable_m = 0; n_skipped_m = 0; n_out_of_graph_m = 0
@@ -448,6 +439,6 @@ def run_shard_routing_eval(
         "split": split,
         "shards_used": available_shards,
     }
-    log(f"  Rolling agg eval done  wall={round(max_wall, 1)}s  -> details: {relpath_for_log(eval_log_path)}")
+    log(f"  test  {result_line(result_m)}  out of graph {result_m['coverage']['out_of_graph_ratio']:.2%}"
+        f"  {round(max_wall, 1)}s")
     return result_m
-

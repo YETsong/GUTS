@@ -13,7 +13,13 @@ same code path.
 Each session of target day d is encoded with the rolling graph of d (the
 previous --rolling_window_size days merged), so sessions with
 d < --rolling_window_size are skipped. The best validation-MRR checkpoint is
-saved as checkpoints/best.pt and evaluated on the test split.
+saved as checkpoints/best.pt; results.json records the train and validation
+metrics of that epoch (the test split is evaluated by the shard routing
+evaluation of the whole run, not per model).
+
+The log is written to train_log.txt in the run directory only (one line per
+epoch with the train and validation metrics); the calling script prints the
+per-model summary.
 """
 
 from __future__ import annotations
@@ -24,7 +30,7 @@ import os
 import random
 import time
 from datetime import datetime
-from typing import Dict, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -32,18 +38,17 @@ import torch.nn as nn
 from torch.optim import Adam
 from torch.utils.data import DataLoader
 
-from guts.utils import append_log as _append_log, ensure_dir, set_seed, timestamp_id
+from guts.method.reporting import format_metrics
+from guts.method.utils import append_log as _append_log, ensure_dir, random_seed, relpath_for_log, repo_relpath, set_seed, timestamp_id
 from guts.yjmob.model.dataset import (
     DayBatchSampler,
     NextGridSessionDataset,
     build_day_index,
     collate_next_grid_sessions,
 )
-from guts.yjmob.model.metrics import finalize_metrics, reciprocal_rank_sum, topk_correct
 from guts.yjmob.model.model import NextGridPredictor
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
-_LOG_LABEL: int = 0  # "[R<label>]" in log lines; only label 0 also prints to stdout
 
 
 class SingleProcess:
@@ -73,10 +78,21 @@ class SingleProcess:
 
 
 def append_log(path: str, message: str):
-    line = f"[{datetime.now().strftime('%H:%M:%S')}] {message}"
-    _append_log(path, line)
-    if _LOG_LABEL == 0:
-        print(line, flush=True)
+    _append_log(path, f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+
+
+# Path arguments stored repository-relative in args.json; --out_root (where a new run
+# directory is created) is not stored.
+_PATH_ARGS = ("processed_dir", "fixed_run_dir", "resume")
+
+
+def stored_args(args: dict) -> dict:
+    """Training arguments as saved in args.json."""
+    return {k: (repo_relpath(v) if k in _PATH_ARGS and v else v) for k, v in args.items() if k != "out_root"}
+
+
+def _round_metrics(metrics: Dict[str, float]) -> Dict[str, float]:
+    return {k: round(float(v), 6) if isinstance(v, float) else v for k, v in metrics.items()}
 
 
 def _make_unique_run_dir(out_root: str, world_size: int, run_name: str) -> str:
@@ -163,6 +179,58 @@ def batch_hidden(
     return hidden[mask], targets[mask], stats
 
 
+# Next-grid metrics: top-k hits and reciprocal ranks summed over batches, averaged at the end.
+
+@torch.no_grad()
+def topk_correct(logits: torch.Tensor, target: torch.Tensor, ks: Iterable[int] = (1, 5, 10)) -> Dict[int, int]:
+    if logits.numel() == 0:
+        return {int(k): 0 for k in ks}
+    # A row with non-finite (NaN/inf) logits means the model diverged for that
+    # sample — force it to count as incorrect instead of letting torch.topk's
+    # NaN ordering accidentally match the target.
+    finite_row = torch.isfinite(logits).all(dim=1)
+    max_k = min(max(int(k) for k in ks), int(logits.size(1)))
+    _, pred = torch.topk(logits, k=max_k, dim=1)
+    correct = pred.eq(target.view(-1, 1)) & finite_row.view(-1, 1)
+    out: Dict[int, int] = {}
+    for k in ks:
+        kk = min(int(k), int(logits.size(1)))
+        out[int(k)] = int(correct[:, :kk].any(dim=1).sum().item())
+    return out
+
+
+@torch.no_grad()
+def target_ranks(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Rank of the target over all classes (1 + number of classes with a higher logit)."""
+    num_classes = logits.size(1)
+    target_scores = logits.gather(1, target.view(-1, 1))
+    ranks = (logits > target_scores).sum(dim=1).float() + 1.0
+    # NaN comparisons are always False, so a fully-diverged (all-NaN) row would
+    # otherwise get rank=1 (a spurious perfect score) instead of being treated
+    # as a total miss. Force those rows to the worst possible rank.
+    finite_row = torch.isfinite(logits).all(dim=1)
+    return torch.where(finite_row, ranks, torch.full_like(ranks, float(num_classes)))
+
+
+@torch.no_grad()
+def reciprocal_rank_sum(logits: torch.Tensor, target: torch.Tensor) -> float:
+    if logits.numel() == 0:
+        return 0.0
+    return float((1.0 / target_ranks(logits, target)).sum().item())
+
+
+def finalize_metrics(total: int, loss_sum: float, correct: Dict[int, int], rr_sum: float) -> Dict[str, float]:
+    denom = max(int(total), 1)
+    return {
+        "loss": float(loss_sum) / denom,
+        "acc@1": float(correct.get(1, 0)) / denom,
+        "acc@5": float(correct.get(5, 0)) / denom,
+        "acc@10": float(correct.get(10, 0)) / denom,
+        "mrr": float(rr_sum) / denom,
+        "support": int(total),
+    }
+
+
 def train_one_epoch(
     model: NextGridPredictor,
     dataset,
@@ -183,7 +251,6 @@ def train_one_epoch(
     rr_sum = 0.0
     total_steps = len(loader)
     t_start = time.time()
-    logged_graph_info = False
 
     for step_idx, batch in enumerate(loader, start=1):
         optimizer.zero_grad(set_to_none=True)
@@ -194,7 +261,7 @@ def train_one_epoch(
             ctx.sync_gradients(model, 0)
             optimizer.step()
             continue
-        hidden, target, stats = batch_hidden(
+        hidden, target, _ = batch_hidden(
             model, dataset, batch, ctx.device, window_size, num_neighbors=num_neighbors,
         )
         logits = model.logits(hidden)
@@ -215,25 +282,18 @@ def train_one_epoch(
                 # after node/edge unlearning) would permanently corrupt later
                 # weights if backpropagated — skip this step instead.
                 append_log(log_path,
-                    f"[R{_LOG_LABEL}] [WARN] non-finite loss at epoch {epoch} step {step_idx} "
+                    f"[WARN] non-finite loss at epoch {epoch} step {step_idx} "
                     f"day {int(batch['day'][0])} (n={n}) — skipping this step")
             del loss
         del logits, hidden, target
         ctx.sync_gradients(model, n_used)
         optimizer.step()
-        if not logged_graph_info:
-            append_log(log_path,
-                f"[R{_LOG_LABEL}] GRAPH | nodes {stats['graph_nodes']} | edges {stats['graph_edges']}")
-            logged_graph_info = True
-        if log_interval > 0 and (step_idx == 1 or step_idx % log_interval == 0):
+        if log_interval > 0 and step_idx % log_interval == 0:
             elapsed = time.time() - t_start
-            sec_per_step = elapsed / step_idx
-            avg_loss = loss_sum / max(sample_count, 1)
             append_log(
                 log_path,
-                f"[R{_LOG_LABEL}] E {epoch:03d} step {step_idx}/{total_steps} ({100 * step_idx // total_steps}%) "
-                f"| loss {avg_loss:.4f} | tokens {sample_count} "
-                f"| {sec_per_step * 1000:.0f}ms/step | elapsed {elapsed:.0f}s",
+                f"  E{epoch:03d} step {step_idx}/{total_steps}  loss {loss_sum / max(sample_count, 1):.4f}"
+                f"  {elapsed / step_idx * 1000:.0f}ms/step  {elapsed:.0f}s",
             )
     return loss_sum, sample_count, correct, rr_sum
 
@@ -264,6 +324,13 @@ def evaluate(model: NextGridPredictor, dataset, loader, ctx: SingleProcess, wind
     return _reduce_metrics(ctx, loss_sum, sample_count, correct, rr_sum)
 
 
+# Checkpoints: last.pt (model + optimizer + training state, for resuming) is written every
+# LAST_CKPT_EVERY epochs and when training ends. best.pt (model weights of the best
+# validation epoch only) is kept in memory during training and written at the end of the
+# warmup, at every last.pt save after it when the best changed, and when training ends.
+LAST_CKPT_EVERY = 10
+
+
 def save_checkpoint(path, epoch, model, optimizer, extra: dict):
     torch.save({
         "epoch": int(epoch),
@@ -271,6 +338,23 @@ def save_checkpoint(path, epoch, model, optimizer, extra: dict):
         "optimizer_state": optimizer.state_dict(),
         "extra": extra,
     }, path)
+
+
+def resumable_checkpoint(run_dir: str) -> Optional[str]:
+    """checkpoints/last.pt of an interrupted run, or None when training must start over:
+    no last.pt, or best.pt does not hold the best epoch recorded in last.pt (the best
+    weights after the last best.pt write were only in memory)."""
+    ckpt_dir = os.path.join(run_dir, "checkpoints")
+    last_path = os.path.join(ckpt_dir, "last.pt")
+    if not os.path.isfile(last_path):
+        return None
+    best_epoch = int(torch.load(last_path, map_location="cpu")["extra"]["best_epoch"])
+    if best_epoch < 1:
+        return last_path
+    best_path = os.path.join(ckpt_dir, "best.pt")
+    if os.path.isfile(best_path) and int(torch.load(best_path, map_location="cpu")["epoch"]) == best_epoch:
+        return last_path
+    return None
 
 
 def _rng_state() -> dict:
@@ -315,7 +399,7 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
                    help="max incoming edges kept per node during training (the smallest value is used); 0 = full graph")
     p.add_argument("--sage_edge_chunk_size", type=int, default=500_000,
                    help="edge chunk size of the aggregation (lower peak GPU memory); 0 = no chunking")
-    p.add_argument("--seed", type=int, default=2026, help="-1 = random seed")
+    p.add_argument("--seed", type=int, default=None, help="default: random (the drawn seed is saved to args.json)")
     p.add_argument("--resume", type=str, default="", help="checkpoint to resume from; --epochs then counts additional epochs")
     p.add_argument("--out_root", type=str, default=os.path.join(_REPO_ROOT, "Results"))
     p.add_argument("--fixed_run_dir", type=str, default="")
@@ -331,14 +415,12 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
     return p
 
 
-def run_training(args: argparse.Namespace, ctx: SingleProcess, log_label: int) -> None:
-    """Train, keep the best validation-MRR checkpoint, and evaluate it on the test split."""
-    global _LOG_LABEL
-    _LOG_LABEL = int(log_label)
+def run_training(args: argparse.Namespace, ctx: SingleProcess) -> Optional[dict]:
+    """Train and keep the best validation-MRR checkpoint; returns results.json on the logging rank, else None."""
     device, rank, world_size, is_log_rank = ctx.device, ctx.rank, ctx.world_size, ctx.is_log_rank
 
-    if args.seed < 0:
-        args.seed = int(ctx.broadcast(int.from_bytes(os.urandom(4), byteorder="big", signed=False) if is_log_rank else 0))
+    if args.seed is None:
+        args.seed = int(ctx.broadcast(random_seed() if is_log_rank else 0))
     set_seed(args.seed)
 
     run_dir = ""
@@ -346,27 +428,18 @@ def run_training(args: argparse.Namespace, ctx: SingleProcess, log_label: int) -
         run_dir = args.fixed_run_dir or _make_unique_run_dir(args.out_root, world_size, args.run_name)
     run_dir = ensure_dir(ctx.broadcast(run_dir))
 
-    log_dir = ensure_dir(os.path.join(run_dir, "logs"))
     ckpt_dir = ensure_dir(os.path.join(run_dir, "checkpoints"))
     last_ckpt_path = os.path.join(ckpt_dir, "last.pt")
-    train_log_path = os.path.join(log_dir, f"train_rank{rank}.txt")
-    val_log_path = os.path.join(log_dir, "val_log.txt")
-    test_log_path = os.path.join(log_dir, "test_log.txt")
+    train_log_path = os.path.join(run_dir, "train_log.txt" if rank == 0 else f"train_log_rank{rank}.txt")
     window_size = int(args.rolling_window_size)
 
-    append_log(train_log_path, "START # GRAPHSAGE NEXT-GRID TRAIN")
-    if is_log_rank:
-        append_log(train_log_path, f"[INIT] run_dir={run_dir}")
-        append_log(train_log_path, f"[INIT] device={device} world_size={world_size} seed={args.seed}")
-        append_log(train_log_path, f"[INIT] sage_num_neighbors={args.sage_num_neighbors} sage_edge_chunk_size={args.sage_edge_chunk_size}")
-
-        append_log(test_log_path, "==============================================")
-        append_log(test_log_path, datetime.now().strftime("%Y/%m/%d - %H:%M:%S"))
-        append_log(test_log_path, "==============================================")
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    append_log(train_log_path, f"GraphSAGE next-grid training  run={relpath_for_log(run_dir)}  device={device}"
+               + (f" (CUDA_VISIBLE_DEVICES={visible})" if visible else "")
+               + f"  rank {rank}/{world_size}  seed={args.seed}")
 
     train_ds = NextGridSessionDataset(args.processed_dir, split="train", part_cache_size=args.part_cache_size)
     val_ds = NextGridSessionDataset(args.processed_dir, split="val", part_cache_size=args.part_cache_size)
-    test_ds = NextGridSessionDataset(args.processed_dir, split="test", part_cache_size=args.part_cache_size)
     if not train_ds.has_rolling_graphs:
         raise ValueError(
             f"{args.processed_dir} has no rolling graphs "
@@ -388,11 +461,6 @@ def run_training(args: argparse.Namespace, ctx: SingleProcess, log_label: int) -
         sage_edge_weight_transform=args.sage_edge_weight_transform,
         sage_edge_chunk_size=int(args.sage_edge_chunk_size),
     ).to(device)
-    append_log(
-        train_log_path,
-        f"[R{_LOG_LABEL}] SAGE GRAPH | weighted {int(args.sage_weighted)} "
-        f"| edge_weight_transform {args.sage_edge_weight_transform}",
-    )
 
     optimizer = Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
@@ -400,6 +468,10 @@ def run_training(args: argparse.Namespace, ctx: SingleProcess, log_label: int) -
     best_val_mrr = -1.0
     best_epoch = -1
     best_ckpt_path = ""
+    best_train_metrics: Dict[str, float] = {}
+    best_val_metrics: Dict[str, float] = {}
+    best_state: Optional[Dict[str, torch.Tensor]] = None  # weights of best_epoch (CPU copy)
+    best_written = -1  # epoch held by best.pt on disk
     epochs_since_improve = 0
     train_ms_acc = 0.0
     val_eval_ms_acc = 0.0
@@ -414,6 +486,8 @@ def run_training(args: argparse.Namespace, ctx: SingleProcess, log_label: int) -
         best_val_mrr = float(ckpt["extra"]["best_val_mrr"])
         best_epoch = int(ckpt["extra"]["best_epoch"])
         best_ckpt_path = str(ckpt["extra"]["best_ckpt_path"])
+        best_train_metrics = dict(ckpt["extra"].get("best_train_metrics", {}))
+        best_val_metrics = dict(ckpt["extra"].get("best_val_metrics", {}))
         if "rng" in ckpt["extra"]:
             # last.pt: continue exactly where the interrupted run stopped.
             epochs_since_improve = int(ckpt["extra"]["epochs_since_improve"])
@@ -421,23 +495,27 @@ def run_training(args: argparse.Namespace, ctx: SingleProcess, log_label: int) -
             val_eval_ms_acc = float(ckpt["extra"]["val_eval_ms"])
             _set_rng_state(ckpt["extra"]["rng"])
             finished = bool(ckpt["extra"]["finished"])
-        append_log(train_log_path, f"[RESUME] {args.resume} -> epoch {start_epoch} (train until epoch {args.epochs})")
+        if best_epoch >= 1:
+            best_ckpt = torch.load(os.path.join(ckpt_dir, "best.pt"), map_location="cpu")
+            if int(best_ckpt["epoch"]) != best_epoch:
+                raise ValueError(f"best.pt holds epoch {best_ckpt['epoch']}, last.pt records best epoch {best_epoch}"
+                                 " (see resumable_checkpoint)")
+            best_state = best_ckpt["model_state"]
+            best_written = best_epoch
+        append_log(train_log_path, f"  resume  {relpath_for_log(args.resume)} -> epoch {start_epoch} (train until epoch {args.epochs})")
     if is_log_rank:
         # Written after resolving --resume so "epochs" is the run's total: the unlearning
         # retrain trains a shard again from scratch with these arguments.
         with open(os.path.join(run_dir, "args.json"), "w", encoding="utf-8") as f:
-            json.dump(vars(args), f, indent=2)
+            json.dump(stored_args(vars(args)), f, indent=2)
 
     def _day_index(split: str, meta: dict) -> Dict[int, List[int]]:
         day_index = build_day_index(args.processed_dir, split, meta)
         return {d: idxs for d, idxs in day_index.items() if d >= window_size}
 
-    append_log(
-        train_log_path,
-        f"[R{_LOG_LABEL}] ROLLING GRAPH | window_size={window_size} "
-        f"| sessions with day < {window_size} are excluded from train/eval",
-    )
-    train_sampler = DayBatchSampler(_day_index("train", train_ds.meta), args.batch_size,
+    train_day_index = _day_index("train", train_ds.meta)
+    val_day_index = _day_index("val", val_ds.meta)
+    train_sampler = DayBatchSampler(train_day_index, args.batch_size,
                                     rank=rank, world_size=world_size, shuffle=True, seed=args.seed)
     train_loader = DataLoader(
         train_ds,
@@ -448,32 +526,41 @@ def run_training(args: argparse.Namespace, ctx: SingleProcess, log_label: int) -
     )
     eval_batch_size = min(args.batch_size, 128)
 
-    def _eval_loader(ds, split):
+    def _eval_loader(ds, day_index):
         # No filler batches: evaluation combines per-rank totals only once at the end.
-        sampler = DayBatchSampler(_day_index(split, ds.meta), eval_batch_size,
+        sampler = DayBatchSampler(day_index, eval_batch_size,
                                   rank=rank, world_size=world_size, shuffle=False, seed=0, equal_steps=False)
         return DataLoader(ds, batch_sampler=sampler, num_workers=0, collate_fn=collate_next_grid_sessions)
 
-    val_loader = _eval_loader(val_ds, "val")
-    test_loader = _eval_loader(test_ds, "test")
+    val_loader = _eval_loader(val_ds, val_day_index)
 
-    append_log(
-        train_log_path,
-        f"[R{_LOG_LABEL}] SETUP | train_sessions {len(train_ds)} | val_sessions {len(val_ds)} "
-        f"| test_sessions {len(test_ds)} | batch {args.batch_size} | part_cache_size {args.part_cache_size}",
-    )
-    append_log(
-        train_log_path,
-        f"[R{_LOG_LABEL}] TOKENS | train {train_ds.total_steps} | val {val_ds.total_steps} | test {test_ds.total_steps}",
-    )
-    append_log(train_log_path, f"[R{_LOG_LABEL}] EVAL | eval_every {args.eval_every}")
-    append_log(train_log_path, f"[R{_LOG_LABEL}] TRAIN LOSS full softmax | classes {train_ds.num_nodes}")
+    n_train = sum(len(v) for v in train_day_index.values())
+    n_val = sum(len(v) for v in val_day_index.values())
+    append_log(train_log_path, f"  data   sessions with day >= {window_size}: train {n_train:,}/{len(train_ds):,}"
+               f"  val {n_val:,}/{len(val_ds):,}  ({len(train_day_index)} train days)")
+    append_log(train_log_path, f"  model  GraphSAGE {args.sage_layers} layers, neighbors {min(args.sage_num_neighbors) if args.sage_num_neighbors else 0}"
+               + (f", weighted ({args.sage_edge_weight_transform})" if args.sage_weighted else ", unweighted")
+               + f" + GRU; full softmax over {train_ds.num_nodes:,} cells")
+    append_log(train_log_path, f"  train  batch {args.batch_size}  lr {args.lr:g}  epochs {args.epochs}  eval every {args.eval_every}"
+               f"  early stop: patience {args.early_stop_patience} after epoch {args.early_stop_warmup}")
+
+    def write_best() -> None:
+        """Write the in-memory best weights to best.pt (no optimizer state) if not written yet."""
+        nonlocal best_written
+        if best_state is None or best_written == best_epoch:
+            return
+        torch.save({"epoch": int(best_epoch), "model_state": best_state, "extra": {
+            "best_val_mrr": float(best_val_mrr),
+            "best_epoch": int(best_epoch),
+            "best_train_metrics": best_train_metrics,
+            "best_val_metrics": best_val_metrics,
+        }}, os.path.join(ckpt_dir, "best.pt"))
+        best_written = best_epoch
 
     epoch = start_epoch - 1
     for epoch in range(start_epoch, (start_epoch if finished else args.epochs + 1)):
         epoch_t0 = time.time()
         train_sampler.set_epoch(epoch)
-        append_log(train_log_path, f"[R{_LOG_LABEL}] ===== Epoch {epoch:03d} ({datetime.now().strftime('%H:%M:%S')}) =====")
         loss_sum, sample_count, correct, rr_sum = train_one_epoch(
             model,
             train_ds,
@@ -489,18 +576,10 @@ def run_training(args: argparse.Namespace, ctx: SingleProcess, log_label: int) -
         train_ms_acc += (time.time() - epoch_t0) * 1000
 
         train_metrics = _reduce_metrics(ctx, loss_sum, sample_count, correct, rr_sum)
-        _mem_alloc_mb = torch.cuda.memory_allocated(device) / (1024 ** 2) if torch.cuda.is_available() else 0.0
-        _mem_reserved_mb = torch.cuda.memory_reserved(device) / (1024 ** 2) if torch.cuda.is_available() else 0.0
-        append_log(
-            train_log_path,
-            (
-                f"[R{_LOG_LABEL}] E {epoch:03d} = Loss {train_metrics['loss']:.4f} | "
-                f"ACC@1 {train_metrics['acc@1']:.4f} | ACC@5 {train_metrics['acc@5']:.4f} | "
-                f"ACC@10 {train_metrics['acc@10']:.4f} | MRR {train_metrics['mrr']:.4f} | "
-                f"TimeSec {time.time() - epoch_t0:.2f} | "
-                f"VRAM alloc={_mem_alloc_mb:.0f}MB reserved={_mem_reserved_mb:.0f}MB"
-            ),
-        )
+        reserved_mb = torch.cuda.memory_reserved(device) / (1024 ** 2) if torch.cuda.is_available() else 0.0
+        epoch_line = (f"E{epoch:03d}  train loss {train_metrics['loss']:.4f} {format_metrics(train_metrics)}"
+                      f"  {time.time() - epoch_t0:.1f}s  VRAM {reserved_mb:.0f}MB")
+        val_metrics = None
 
         should_eval = args.eval_every > 0 and epoch % args.eval_every == 0
         if should_eval:
@@ -508,37 +587,21 @@ def run_training(args: argparse.Namespace, ctx: SingleProcess, log_label: int) -
             torch.cuda.empty_cache()
             val_metrics = evaluate(model, val_ds, val_loader, ctx, window_size)
             val_eval_ms_acc += (time.time() - t0_val_eval) * 1000
-            if is_log_rank:
-                append_log(
-                    val_log_path,
-                    (
-                        f"[VAL] E {epoch:03d} | loss {val_metrics['loss']:.4f} | "
-                        f"ACC@1 {val_metrics['acc@1']:.4f} | ACC@5 {val_metrics['acc@5']:.4f} | "
-                        f"ACC@10 {val_metrics['acc@10']:.4f} | MRR {val_metrics['mrr']:.4f} | "
-                        f"support {val_metrics['support']}"
-                    ),
-                )
+            epoch_line += f"  | val loss {val_metrics['loss']:.4f} {format_metrics(val_metrics)}"
             cur_val_mrr = val_metrics["mrr"] if not np.isnan(val_metrics["mrr"]) else -1.0
             if cur_val_mrr > best_val_mrr:
                 best_val_mrr = float(cur_val_mrr)
                 best_epoch = int(epoch)
+                best_train_metrics = _round_metrics(train_metrics)
+                best_val_metrics = _round_metrics(val_metrics)
                 epochs_since_improve = 0
                 best_ckpt_path = os.path.join(ckpt_dir, "best.pt")
                 if is_log_rank:
-                    save_checkpoint(
-                        best_ckpt_path,
-                        epoch,
-                        model,
-                        optimizer,
-                        extra={
-                            "best_val_mrr": float(best_val_mrr),
-                            "best_epoch": int(best_epoch),
-                            "best_ckpt_path": str(best_ckpt_path),
-                        },
-                    )
-                    append_log(train_log_path, f"[CKPT] best.pt updated | best_val_mrr {best_val_mrr:.6f} | epoch {best_epoch:03d}")
+                    best_state = {k: v.detach().to("cpu", copy=True) for k, v in model.state_dict().items()}
+                epoch_line += "  *best"
             else:
                 epochs_since_improve += 1
+        append_log(train_log_path, epoch_line)
 
         early_stop = (
             should_eval
@@ -546,17 +609,24 @@ def run_training(args: argparse.Namespace, ctx: SingleProcess, log_label: int) -
             and epoch >= args.early_stop_warmup
             and epochs_since_improve >= args.early_stop_patience
         )
-        if is_log_rank:
-            # Exact resume point for an interrupted run (removed once results.json is written).
+        finished_now = bool(early_stop or epoch == args.epochs)
+        save_last = finished_now or epoch % LAST_CKPT_EVERY == 0
+        if is_log_rank and (finished_now or (epoch >= args.early_stop_warmup
+                                             and (epoch == args.early_stop_warmup or save_last))):
+            write_best()
+        if is_log_rank and save_last:
+            # Resume point for an interrupted run (removed once results.json is written).
             save_checkpoint(last_ckpt_path, epoch, model, optimizer, extra={
                 "best_val_mrr": float(best_val_mrr),
                 "best_epoch": int(best_epoch),
                 "best_ckpt_path": str(best_ckpt_path),
+                "best_train_metrics": best_train_metrics,
+                "best_val_metrics": best_val_metrics,
                 "epochs_since_improve": int(epochs_since_improve),
                 "train_ms": float(train_ms_acc),
                 "val_eval_ms": float(val_eval_ms_acc),
                 "rng": _rng_state(),
-                "finished": bool(early_stop or epoch == args.epochs),
+                "finished": finished_now,
             })
         # Other ranks may read best.pt only after rank 0 has written it.
         ctx.barrier()
@@ -565,35 +635,15 @@ def run_training(args: argparse.Namespace, ctx: SingleProcess, log_label: int) -
             if is_log_rank:
                 append_log(
                     train_log_path,
-                    f"[EARLY STOP] val MRR no improvement for {epochs_since_improve} epochs "
-                    f"(warmup={args.early_stop_warmup}, patience={args.early_stop_patience}) "
-                    f"-> stopping at epoch {epoch:03d} (best_epoch={best_epoch:03d})",
+                    f"early stop at E{epoch:03d}: no val MRR improvement for {epochs_since_improve} epochs"
+                    f" (best E{best_epoch:03d}, val MRR {best_val_mrr:.4f})",
                 )
             break
 
-    if best_ckpt_path and os.path.exists(best_ckpt_path):
-        ckpt = torch.load(best_ckpt_path, map_location="cpu")
-        model.load_state_dict(ckpt["model_state"])
-        if is_log_rank:
-            append_log(test_log_path, f"[LOAD BEST] {best_ckpt_path}")
-    torch.cuda.empty_cache()
-    t0_predict = time.time()
-    test_metrics = evaluate(model, test_ds, test_loader, ctx, window_size)
-    predict_ms = (time.time() - t0_predict) * 1000
     if is_log_rank:
-        append_log(
-            test_log_path,
-            (
-                f"[TEST FINAL] loss {test_metrics['loss']:.4f} | ACC@1 {test_metrics['acc@1']:.4f} | "
-                f"ACC@5 {test_metrics['acc@5']:.4f} | ACC@10 {test_metrics['acc@10']:.4f} | "
-                f"MRR {test_metrics['mrr']:.4f} | support {test_metrics['support']}"
-            ),
-        )
-        append_log(test_log_path, f"[BEST] best_val_mrr: {best_val_mrr:.6f} | best_epoch: {best_epoch:03d}")
         results = {
             "experiment_type": "graphsage_next_grid",
-            "run_dir": run_dir,
-            "processed_dir": os.path.abspath(args.processed_dir),
+            "run_dir": repo_relpath(run_dir),
             "device": str(device),
             "world_size": int(world_size),
             "epochs": int(args.epochs),
@@ -603,12 +653,12 @@ def run_training(args: argparse.Namespace, ctx: SingleProcess, log_label: int) -
             "early_stop_patience": int(args.early_stop_patience),
             "best_epoch": int(best_epoch),
             "best_val_mrr": round(float(best_val_mrr), 6),
+            "best_train_metrics": best_train_metrics,
+            "best_val_metrics": best_val_metrics,
             "timing_ms": {
                 "train": round(train_ms_acc),
                 "val_eval": round(val_eval_ms_acc),
-                "predict": round(predict_ms),
             },
-            "metrics": {k: round(float(v), 6) if isinstance(v, float) else v for k, v in test_metrics.items()},
             "model": {
                 "sage_weighted": bool(args.sage_weighted),
                 "sage_edge_weight_transform": args.sage_edge_weight_transform,
@@ -625,6 +675,15 @@ def run_training(args: argparse.Namespace, ctx: SingleProcess, log_label: int) -
         results_path = os.path.join(run_dir, "results.json")
         with open(results_path, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2, default=str)
-        append_log(test_log_path, f"[RESULTS] saved -> {results_path}")
+        append_log(train_log_path, f"done  -> {relpath_for_log(results_path)}")
         if os.path.exists(last_ckpt_path):
             os.remove(last_ckpt_path)
+        return results
+    return None
+
+
+def summary_line(results: dict) -> str:
+    """One-line summary of a trained model: best/stopped epoch, train and val metrics at the best epoch."""
+    return (f"best E{int(results['best_epoch']):03d}/stopped E{int(results['stopped_epoch']):03d}"
+            f" | train {format_metrics(results.get('best_train_metrics'))}"
+            f" | val {format_metrics(results.get('best_val_metrics'))}")

@@ -14,7 +14,7 @@ partition:
 
   # boundary refinement
   use_boundary_refinement: true
-  refine_epsilon: 0.05
+  refine_epsilon: 1.0
   refine_max_passes: 5
   refine_candidate_max_ratio: 0.10
   lambda_di: 1.0

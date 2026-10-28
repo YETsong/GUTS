@@ -11,8 +11,9 @@ Usage:
 
 Output ({output.root}/{run_name}/):
     Sharding/            partition/, processed/shard_{k}/, refinement_metrics.json
-    graphsage_runs/      shard_{k}/ checkpoints + per-shard results.json
-    logs/                pipeline.txt, eval_log.txt
+    graphsage_runs/      shard_{k}/: checkpoints, results.json, train_log.txt
+    run_log.txt          the lines printed to the console (progress and results)
+    eval_log.txt         shard routing evaluation details
     results.json         final metrics
     config_used.yaml     exact config used
 """
@@ -24,7 +25,6 @@ import os
 import sys
 import time
 import warnings
-from datetime import datetime
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 if _REPO_ROOT not in sys.path:
@@ -35,9 +35,12 @@ warnings.filterwarnings("ignore", message="pkg_resources is deprecated as an API
 import torch
 import yaml
 
-from guts.config import align_retrain_seed, config_to_dict, load_config, resolve_output_dirs
-from guts.utils import append_log_synced, compact_json, ensure_dir, relpath_for_log, timestamp_id
-from guts.yjmob.stage_eval import run_shard_routing_eval
+from guts.method.config import config_to_dict, parse_overrides
+from guts.method.reporting import mean_std
+from guts.yjmob.config import load_yjmob_config, resolve_output_dirs
+from guts.method.utils import (compact_json, ensure_dir, relpath_for_log, repo_relpath, resolve_seed, run_logger,
+                               seed_mismatch_warning, timestamp_id)
+from guts.yjmob.stage_eval import result_line, run_shard_routing_eval
 from guts.yjmob.stage_partition import run_partition_stage, source_days
 from guts.yjmob.stage_train import run_train_stage
 
@@ -46,7 +49,7 @@ from guts.yjmob.stage_train import run_train_stage
 # CLI
 # ──────────────────────────────────────────────────────────────────────────────
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Multi-day GUTS pipeline for yjmob next-grid prediction.")
     p.add_argument("--config", required=True, help="YAML config (e.g. configs/yjmob_14d.yaml)")
     p.add_argument("--days", type=int, nargs="*", default=None, help="training days (default: all days in the data)")
@@ -56,29 +59,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--graphsage-source-processed-dir", default="",
                    help="preprocessed data dir (default: cfg.data.nextgrid_processed_dir)")
     p.add_argument("--sharded-dir", default="", help="reuse an existing Sharding/ dir")
+    p.add_argument("--seed", type=int, default=None,
+                   help="run seed: partition and shard training; default: training.seed in the YAML, else random")
     p.add_argument("--override", nargs="*", default=[], metavar="KEY=VALUE", help="config overrides, e.g. training.epochs=3")
     p.add_argument("--resume-dir", default="", dest="resume_dir", help="continue an interrupted run directory")
-    return p.parse_args()
-
-
-def _parse_overrides(override_list) -> dict:
-    result = {}
-    for item in (override_list or []):
-        if "=" not in item:
-            raise ValueError(f"Override must be KEY=VALUE, got: {item!r}")
-        key, raw_val = item.split("=", 1)
-        for cast in (int, float):
-            try:
-                result[key] = cast(raw_val)
-                break
-            except ValueError:
-                pass
-        else:
-            if raw_val.lower() in ("true", "false"):
-                result[key] = raw_val.lower() == "true"
-            else:
-                result[key] = raw_val
-    return result
+    return p.parse_args(argv)
 
 
 def _resolve_device(device_str: str) -> torch.device:
@@ -110,27 +95,38 @@ def _resolve_devices(num_gpus: int, device_str: str):
     return [torch.device(f"cuda:{i}") for i in range(num_gpus)]
 
 
-def _mean_std_ms(values: list) -> dict:
-    """Mean and sample standard deviation (ddof=1; 0 for a single value)."""
-    n = len(values)
-    if n == 0:
-        return None
-    m = sum(values) / n
-    var = sum((v - m) ** 2 for v in values) / (n - 1) if n > 1 else 0.0
-    return {"mean": round(m, 3), "std": round(var ** 0.5, 3), "min": min(values), "max": max(values), "n": n}
+def resolve_run_seed(cfg, args, overrides: dict, run_dir: str) -> str:
+    """Set cfg.training.seed: --seed, else training.seed (YAML/override), else a random seed.
+    A resumed run keeps its saved seed; a different explicit seed is an error. config_used.yaml
+    records the result. Returns the note of the header line ("given", "random" or "")."""
+    resumed_cfg_path = os.path.join(run_dir, "config_used.yaml")
+    if args.resume_dir and os.path.exists(resumed_cfg_path):
+        saved_seed = load_yjmob_config(resumed_cfg_path).training.seed
+        # Only an explicitly given seed is checked; the YAML default is replaced by the saved one.
+        given = args.seed if args.seed is not None else (
+            cfg.training.seed if "training.seed" in overrides else None)
+        if given is not None and given != saved_seed:
+            raise ValueError(f"seed {given} differs from the resumed run's seed {saved_seed}")
+        cfg.training.seed = saved_seed
+        return ""
+    if args.seed is not None:
+        cfg.training.seed = resolve_seed(args.seed)
+        return "given"
+    seed_msg = "random" if cfg.training.seed is None else ""
+    cfg.training.seed = resolve_seed(cfg.training.seed)
+    return seed_msg
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
 
-def main() -> None:
-    args = parse_args()
+def main(argv=None) -> None:
+    """argv: argument list (as on the command line); None reads sys.argv."""
+    args = parse_args(argv)
 
-    overrides = _parse_overrides(args.override)
-    cfg = load_config(args.config, overrides=overrides)
-    # Retrain on a per-seed clean dataset: train with the forget-set seed.
-    seed_msg = align_retrain_seed(cfg, args.graphsage_source_processed_dir or cfg.data.nextgrid_processed_dir, overrides)
+    overrides = parse_overrides(args.override)
+    cfg = load_yjmob_config(args.config, overrides=overrides)
 
     if args.out:
         cfg.output.root = args.out
@@ -147,49 +143,36 @@ def main() -> None:
         cfg     = resolve_output_dirs(cfg)
         run_dir = os.path.join(cfg.output.root, cfg.output.run_name)
 
-    # ── Logging ───────────────────────────────────────────────────────────────
-    log_dir       = ensure_dir(os.path.join(run_dir, "logs"))
-    log_path      = os.path.join(log_dir, "pipeline.txt")
-    eval_log_path = os.path.join(log_dir, "eval_log.txt")
+    seed_msg = resolve_run_seed(cfg, args, overrides, run_dir)
 
-    def log(msg: str) -> None:
-        ts   = datetime.now().strftime("%H:%M:%S")
-        line = f"[{ts}] {msg}"
-        print(line, flush=True)
-        append_log_synced(log_path, line)
+    # ── Logging: console + run_log.txt; details go to eval_log.txt and the shard logs ──
+    ensure_dir(run_dir)
+    run_log_path  = os.path.join(run_dir, "run_log.txt")
+    eval_log_path = os.path.join(run_dir, "eval_log.txt")
+    log = run_logger(run_log_path)
 
     # ── Dataset + train days ──────────────────────────────────────────────────
-    log("=" * 60)
-    _strategy_label = str(cfg.partition.strategy).upper()
-    log(f"GRAPH UNLEARNING PIPELINE  strategy={_strategy_label}  (multi-day)")
-    log(f"  run_dir : {relpath_for_log(run_dir)}")
-    log(f"  config  : {relpath_for_log(args.config)}")
-    log(f"  gpus    : {num_gpus}  {[str(d) for d in devices]}")
-    log(f"  K shards: {cfg.partition.num_shards}")
-    log("  model   : graphsage")
-    log(f"  seed    : {cfg.training.seed}" + (f"  [{seed_msg}]" if seed_msg else ""))
-    log("=" * 60)
+    log(f"GUTS pipeline{' (resumed)' if args.resume_dir else ''}  {time.strftime('%Y-%m-%d')}  run={relpath_for_log(run_dir)}"
+        f"  seed={cfg.training.seed}" + (f" ({seed_msg})" if seed_msg else "")
+        + f"  K={cfg.partition.num_shards}  GPUs={num_gpus}")
 
     nextgrid_source_dir = args.graphsage_source_processed_dir or cfg.data.nextgrid_processed_dir
-    # The partitioner reads the train paths and grid of this same directory.
+    seed_warning = seed_mismatch_warning(nextgrid_source_dir, cfg.training.seed)
+    if seed_warning:
+        log(seed_warning)
+    # The partitioner reads the train trajs and grid of this same directory.
     cfg.data.nextgrid_processed_dir = nextgrid_source_dir
 
-    if args.days:
-        train_days = sorted(args.days)
-        log(f"Using specified days: {train_days}")
-    else:
-        train_days = source_days(nextgrid_source_dir)
-        log(f"Using all {len(train_days)} next-grid days: {train_days[:5]}...{train_days[-5:]}")
+    train_days = sorted(args.days) if args.days else source_days(nextgrid_source_dir)
+    log(f"  data={relpath_for_log(nextgrid_source_dir)}  days {train_days[0]}-{train_days[-1]} ({len(train_days)})")
 
+    # A resumed run keeps the config_used.yaml of its first start.
     _config_used_path = os.path.join(run_dir, "config_used.yaml")
-    if os.path.exists(_config_used_path):
-        log("  config_used.yaml already exists — keeping the first run's values (not rewritten on resume)")
-    else:
+    if not os.path.exists(_config_used_path):
         _save_config_yaml(cfg, _config_used_path)
 
     wall_start = time.time()
 
-    log("=" * 60)
     _ext_sharding = args.sharded_dir
     sharding_dir  = os.path.abspath(_ext_sharding) if _ext_sharding \
                     else ensure_dir(os.path.join(run_dir, "Sharding"))
@@ -198,8 +181,7 @@ def main() -> None:
     partition_ms_total, build_ms_total = part["partition_ms"], part["build_ms"]
     refinement_summary = part["refinement"]
 
-    log("=" * 60)
-    log("STEP 2/3  Build/reuse GraphSAGE data + train shard models")
+    log("STEP 2/3 shard data + shard training")
     preprocess_summary, shard_results = run_train_stage(
         cfg=cfg,
         args=args,
@@ -207,24 +189,23 @@ def main() -> None:
         train_days=train_days,
         by_day=by_day,
         devices=devices,
-        eval_log_path=eval_log_path,
         log=log,
+        run_log_path=run_log_path,
     )
 
-    log("=" * 60)
-    log("STEP 3/3  Shard routing evaluation (all shards)")
+    log("STEP 3/3 shard routing evaluation (test)")
     t0_agg_eval = time.time()
     agg_eval_results = run_shard_routing_eval(
         run_dir=run_dir,
         full_data_dir=nextgrid_source_dir,
         eval_log_path=eval_log_path,
-        log=log,
         window_size=cfg.temporal_graph.window_size,
         num_gpus_eval=num_gpus,
         sharding_dir=sharding_dir,
     )
 
     agg_eval_ms = round((time.time() - t0_agg_eval) * 1000)
+    log(f"  test  {result_line(agg_eval_results)}  {agg_eval_ms / 1000:.0f}s")
     shard_train_ms = [
         r.get("timing_ms", {}).get("train") for r in shard_results.values()
         if r.get("timing_ms", {}).get("train") is not None
@@ -236,15 +217,14 @@ def main() -> None:
     timing_ms = {
         "partition": partition_ms_total,
         "build": build_ms_total,
-        "per_shard_train": _mean_std_ms(shard_train_ms),
-        "per_shard_val_eval": _mean_std_ms(shard_val_eval_ms),
+        "per_shard_train": mean_std(shard_train_ms, digits=3, extremes=True),
+        "per_shard_val_eval": mean_std(shard_val_eval_ms, digits=3, extremes=True),
         "agg_eval_test": agg_eval_ms,
     }
 
-    log("=" * 60)
     results = {
         "experiment_type": "guts_graphsage_pipeline",
-        "run_dir": run_dir,
+        "run_dir": repo_relpath(run_dir),
         "train_days": train_days,
         "num_gpus": num_gpus,
         "devices": [str(d) for d in devices],
@@ -264,18 +244,17 @@ def main() -> None:
     results_path = os.path.join(run_dir, "results.json")
     with open(results_path, "w", encoding="utf-8") as f:
         f.write(compact_json(results))
-    log("=" * 60)
-    log(f"PIPELINE COMPLETE  strategy={_strategy_label}  total_wall={results['wall_time_s']:.1f}s")
-    log(f"  results  → {relpath_for_log(results_path)}")
-    log(f"  eval_log → {relpath_for_log(eval_log_path)}")
-    log("=" * 60)
-    return
+    log(f"done  {results['wall_time_s']:.0f}s  -> {relpath_for_log(results_path)}")
 
 
 def _save_config_yaml(cfg, path: str) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    data = config_to_dict(cfg)
+    # Paths are stored relative to the repository root (see repo_relpath).
+    data["data"]["nextgrid_processed_dir"] = repo_relpath(data["data"]["nextgrid_processed_dir"])
+    data["output"]["root"] = repo_relpath(data["output"]["root"])
     with open(path, "w") as f:
-        yaml.dump(config_to_dict(cfg), f, default_flow_style=False)
+        yaml.dump(data, f, default_flow_style=False)
 
 
 

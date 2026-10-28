@@ -1,0 +1,31 @@
+{
+  "source_dir": "processed/yjmob_1_14d",
+  "method": "quantile, 4 strata (equal bounds merged)",
+  "measures": {
+    "node": "out_degree",
+    "edge": "weight",
+    "user": "traj_count",
+    "traj": "length"
+  },
+  "bounds": {
+    "node": [
+      15,
+      134,
+      468
+    ],
+    "edge": [
+      1,
+      2
+    ],
+    "user": [
+      10,
+      11,
+      13
+    ],
+    "traj": [
+      4,
+      7,
+      13
+    ]
+  }
+}

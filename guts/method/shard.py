@@ -1,43 +1,17 @@
-"""Common shard construction: one PyG subgraph per shard from a partition."""
+"""Common shard construction: one PyG subgraph per shard from a partition.
+
+A sample is any graph container with `x` [num_nodes, in_dim], `in_dim` and
+`edge_index` (yjmob TemporalSample, static-graph CoraSample)."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List
 
 import torch
 from torch_geometric.data import Data
 
 if TYPE_CHECKING:
-    from guts.partition.partitioner import GUTSPartition
-
-
-@dataclass
-class TemporalSample:
-    """
-    Typed container for one day graph sample.
-
-    Field shapes:
-        x           : FloatTensor [num_nodes, in_dim]
-        edge_index  : LongTensor  [2, num_edges]
-        edge_weight : FloatTensor [num_edges]   (ones if absent)
-    """
-    day: int
-    x: torch.Tensor
-    edge_index: torch.Tensor
-    edge_weight: torch.Tensor
-
-    @property
-    def num_nodes(self) -> int:
-        return int(self.x.size(0))
-
-    @property
-    def num_edges(self) -> int:
-        return int(self.edge_index.size(1))
-
-    @property
-    def in_dim(self) -> int:
-        return int(self.x.size(1))
+    from guts.method.partition.partitioner import GUTSPartition
 
 
 class ShardBuilder:
@@ -50,14 +24,14 @@ class ShardBuilder:
     def build(
         self,
         partition: GUTSPartition,
-        sample: TemporalSample,
+        sample,
     ) -> Dict[int, Data]:
         """
-        Build a Dict[shard_id, Data] from a GUTSPartition + TemporalSample.
+        Build a Dict[shard_id, Data] from a GUTSPartition + the partitioned sample.
 
         Args:
             partition: GUTSPartition from GUTSPartitioner.fit().
-            sample   : TemporalSample whose edge_index and x are being split.
+            sample   : Sample whose x is being split.
 
         Returns:
             Dict mapping shard_id → PyG Data (intra-shard, no ghost nodes).
@@ -77,7 +51,7 @@ class ShardBuilder:
         self,
         global_nodes: List[int],
         shard_edge_index: torch.Tensor,
-        sample: TemporalSample,
+        sample,
     ) -> Data:
         """
         Build the PyG Data object for a single shard.
@@ -93,7 +67,7 @@ class ShardBuilder:
         Args:
             global_nodes     : Sorted list of global node IDs in this shard.
             shard_edge_index : Intra-shard edge_index (LOCAL IDs from GUTSPartitioner).
-            sample           : Source TemporalSample.
+            sample           : Source sample.
 
         Returns:
             PyG Data object.

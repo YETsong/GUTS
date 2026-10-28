@@ -7,26 +7,24 @@
 <p align="center">
   <a href="#overview">Overview</a> ·
   <a href="#requirements">Requirements</a> ·
+  <a href="#experiment-notebooks">Notebooks</a> ·
   <a href="#yjmob">YJMob</a> ·
+  <a href="#cora">Cora</a> ·
   <a href="#configuration">Configuration</a>
 </p>
 
 ## Overview
 
-GUTS is a shard-based graph unlearning framework for trajectory data. The training graph is
-split into K shards with one model each, and a deletion request retrains only the shards whose
-training data contain the deleted data. GUTS builds the shards so that a request touches few
-shards and trajectories stay inside one shard.
+GUTS is a shard-based graph unlearning framework for trajectory data: a deletion request
+retrains only the affected shards, and GUTS partitions the graph so that few shards are affected.
+The code covers **YJMob** (next-location prediction) and **Cora** (node classification).
 
 | Component | Paper | Code |
 |---|:---:|---|
-| **Deletion Influence** — how far a trajectory's deletion would spread over shards (TF, UC\*) | §4.1 | `guts/partition/partitioner.py` |
-| **Hypergraph partitioning** — trajectories as weighted hyperedges, partitioned with KaHyPar | §4.2 | `guts/partition/partitioner.py` |
-| **Boundary Refinement** — moves boundary nodes to reduce fragmentation and cross-shard transitions | §4.3 | `guts/partition/refinement.py` |
-| **Temporal Subgraph Assignment** — maps each day's shards to the persistent shard models | §4.4 | `guts/partition/assignment.py` |
-
-The code covers **YJMob** (large-scale grid trajectories, next-location prediction) and
-**Cora** (static citation graph, node classification).
+| Deletion Influence | §4.1 | `guts/method/partition/partitioner.py` |
+| Hypergraph partitioning (KaHyPar) | §4.2 | `guts/method/partition/partitioner.py` |
+| Boundary Refinement | §4.3 | `guts/method/partition/refinement.py` |
+| Temporal Subgraph Assignment | §4.4 | `guts/method/partition/assignment.py` |
 
 ![GUTS pipeline overview](assets/pipeline_overview.png)
 
@@ -35,24 +33,12 @@ The figures in the paper can be reproduced with the notebooks in `Analysis/`.
 ## Repository layout
 
 ```
-configs/                 yjmob_14d.yaml, cora.yaml
-guts/
-  config.py              YAML config loader
-  shard.py               partition -> per-shard PyG subgraphs
-  partition/             GUTS partitioner (§4.1-§4.4) and its KaHyPar preset
-  yjmob/
-    pipeline.py          entry point: partition -> shard training -> evaluation
-    stage_partition.py   STEP 1  partition every training day
-    stage_train.py       STEP 2  shard datasets + one model per shard
-    stage_eval.py        STEP 3  shard routing evaluation
-    data/                preprocess.py, shard_data.py, rolling_graphs.py
-    model/               GraphSAGE + GRU model, train_single.py, train_multi_gpu.py
-    unlearning/          forget sets, unlearning (batch and stream)
-  cora/                  Cora pipeline, unlearning, forget sets, clean data
-processed/               datasets, forget sets, clean data (not committed)
-Results/                 run outputs (not committed)
+configs/                 YAML configs (yjmob_14d.yaml, cora.yaml)
+experiments_*.ipynb      experiment notebooks
+guts/method/             GUTS partitioner and shared code
+guts/yjmob/              YJMob pipeline, Full-Graph baseline, unlearning
+guts/static_graph/       Cora pipeline, Full-Graph baseline, unlearning
 Analysis/                notebooks for the paper figures
-assets/                  README images
 ```
 
 ## Requirements
@@ -60,7 +46,8 @@ assets/                  README images
 ```
 python 3.9
 torch 1.13.1 (CUDA 11.7)   torch_geometric 2.0.4   kahypar 1.3.6
-numpy 1.26   scipy 1.13   pandas 2.3   scikit-learn 1.6   pyyaml 6.0   tqdm 4.67
+numpy 1.26   scipy 1.13   pandas 2.3   scikit-learn 1.6   pyyaml 6.0
+jupyter (for the experiment notebooks)
 ```
 
 ## Experimental environment
@@ -70,100 +57,114 @@ numpy 1.26   scipy 1.13   pandas 2.3   scikit-learn 1.6   pyyaml 6.0   tqdm 4.67
 > - **GPU** 4 × NVIDIA GeForce RTX 3080 (10 GB)
 > - **Memory** 128 GB
 
+## Experiment notebooks
+
+The notebooks run a whole experiment (data, Full-Graph baseline, GUTS, shard unlearning, result
+tables) with the commands below. Start Jupyter from the repository root.
+
+- `experiments_yjmob.ipynb` — YJMob
+- `experiments_cora.ipynb` — Cora
+
 ## YJMob
 
-Run every command from the repository root.
+[YJMob100K](https://zenodo.org/records/10142719) holds 75 days of anonymized mobility of 100,000
+users on a 200 × 200 grid. Put `yjmob100k-dataset1.csv` (decompressed, sorted by `uid`) in
+`processed/yjmob/raw/`. Run every command from the repository root.
 
-### 1. Data
-
-Put `yjmob100k-dataset1.csv` of the YJMob100K dataset (sorted by `uid`) in
-`processed/yjmob/raw/`, then build the 14-day dataset used by `configs/yjmob_14d.yaml`:
+**14-day dataset** (`processed/yjmob_1_14d`)
 
 ```bash
 python guts/yjmob/data/preprocess.py --dataset_name dataset1 --day_range 0 13 --out_name yjmob_1_14d
 ```
 
-Each user's sessions are split 70/10/20 into train/val/test. The output also holds one
-transition graph per day and the per-day train trajectories read by the partitioner.
-
-### 2. Partition, train, evaluate
+**GUTS run** — partition, shard training, evaluation (`Results/shard-runs/yjmob_14d/`)
 
 ```bash
 python guts/yjmob/pipeline.py --config configs/yjmob_14d.yaml --num-gpus 4
-
-# quick check on a few days
-python guts/yjmob/pipeline.py --config configs/yjmob_14d.yaml --num-gpus 4 \
-    --days 0 1 2 3 4 --override training.epochs=3
 ```
 
-| Step | |
-|:---:|---|
-| 1 | Partition every training day into K shards. |
-| 2 | Build one dataset per shard and train one GraphSAGE + GRU model per shard. The graph for day *d* merges the shard's graphs of the previous `window_size` days. |
-| 3 | **Shard routing evaluation** — each test step of day *d* goes to the shard that held its current cell most often in the partitions before day *d*, and that shard's model predicts the next cell (ACC@1/5/10, MRR). |
-
-Results are written to `Results/shard-runs/yjmob_14d/<run>/`. An interrupted run continues with
-`--resume-dir <run>`.
-
-### 3. Unlearning
-
-#### 3.1 Forget sets
+**Full-Graph baseline** (`Results/runs/yjmob_14d/`)
 
 ```bash
-python guts/yjmob/unlearning/forget_sets.py --source_dir processed/yjmob_1_14d --types uid node edge path
+python guts/yjmob/full_graph.py --config configs/yjmob_14d.yaml --num-gpus 4
 ```
 
-Deletion requests are sampled from the train sessions and saved to
-`processed/forget_sets/yjmob/{Uid,Node,Edge,Path}/`.
+**Forget sets** (`processed/forget_sets/yjmob/`)
 
-#### 3.2 Clean data
+```bash
+python guts/yjmob/unlearning/forget_sets.py strata --source_dir processed/yjmob_1_14d
+python guts/yjmob/unlearning/forget_sets.py batch --source_dir processed/yjmob_1_14d \
+    --types user node edge traj --percent 0.05 --seed 2026
+```
 
-The same preprocessing without the forget set, on the original grid:
+**Clean data** without a forget set (`--exclude_{users,nodes,edges,trajs}_from`)
 
 ```bash
 python guts/yjmob/data/preprocess.py --dataset_name dataset1 --day_range 0 13 \
     --fixed_grid_info_from processed/yjmob_1_14d/next_location_meta.pt \
-    --exclude_uids_from <forget_set>.json --out_name yjmob_1_14d_clean_<tag>
+    --exclude_nodes_from <forget_set>.json --out_name yjmob_1_14d_clean_<tag>
 ```
 
-Use `--exclude_nodes_from`, `--exclude_edges_from` or `--exclude_paths_from` for the other
-types. Remaining sessions keep their original split.
-
-#### 3.3 Retraining baseline
+**Retraining baselines** on the clean data — Shard-Retrain with `pipeline.py`, Full-Retrain with `full_graph.py`
 
 ```bash
 python guts/yjmob/pipeline.py --config configs/yjmob_14d.yaml --num-gpus 4 \
-    --graphsage-source-processed-dir processed/yjmob_1_14d_clean_<tag>
+    --graphsage-source-processed-dir processed/yjmob_1_14d_clean_<tag> --seed <seed>
 ```
 
-A clean directory ending with `_seed<N>` is trained with seed N.
-
-#### 3.4 Shard unlearning
+**Shard unlearning** of a GUTS run (`Results/shard-unlearns/yjmob_14d/`)
 
 ```bash
-python guts/yjmob/unlearning/unlearn.py --state_dir Results/shard-runs/yjmob_14d/<run> \
-    --forget_type uid --forget_set_path <forget_set>.json \
+python guts/yjmob/unlearning/unlearn_batch.py --state_dir Results/shard-runs/yjmob_14d/<run> \
+    --forget_type node --forget_set_path <forget_set>.json \
     --clean_source_dir processed/yjmob_1_14d_clean_<tag> --num_gpus 4
 ```
 
-Only the affected shards are rebuilt from the clean data with the original partitions and
-retrained; the other shards keep their data and models. Results are written to
-`Results/shard-unlearns/yjmob_14d/<run>/`.
+## Cora
 
-#### 3.5 Stream unlearning
+Each run uses one seed and one model (`graphsage`, `gcn`, `gat` or `gin`); `experiments_cora.ipynb`
+repeats them over seeds and models. The Cora dataset is downloaded by PyG on first use.
 
-Requests are processed one at a time, in record order (`uid`, `node` or `path`):
+**Split file** — stratified 80/20 train/test split (`processed/Cora_split/cora_seed2026.pt`)
 
 ```bash
-python guts/yjmob/unlearning/stream_forget_sets.py --index_path processed/yjmob_1_14d/raw_unlearn_index.pkl --n 20
-
-python guts/yjmob/unlearning/unlearn_stream.py --state_dir Results/shard-runs/yjmob_14d/<run> \
-    --forget_type node --forget_set_path processed/forget_sets/yjmob/Node/forget_nodes_seed2026_n20_stream.json \
-    --clean_source_template processed/yjmob_1_14d_clean_node_stream/k{step:03d} --num_gpus 4
+python guts/static_graph/cora_data.py split --seed 2026
 ```
 
-Step k reads clean data built without the first k records of the forget set. Pass an existing
-`--out_dir` to continue an interrupted stream.
+**Forget sets** drawn from the train part (`processed/forget_sets/Cora/{Node,Edge}/`)
+
+```bash
+python guts/static_graph/forget_sets.py --data_path processed/Cora_split/cora_seed2026.pt \
+    --types node edge --percent 0.5 --seed 2026
+```
+
+**GUTS run** — partition the train graph, one model per shard, evaluation on the full graph
+
+```bash
+python guts/static_graph/pipeline.py --config configs/cora.yaml \
+    --data_path processed/Cora_split/cora_seed2026.pt --model_type graphsage --seed 2026
+```
+
+**Full-Graph baseline** — one model on the train graph
+
+```bash
+python guts/static_graph/full_graph.py --config configs/cora.yaml \
+    --data_path processed/Cora_split/cora_seed2026.pt --model_type graphsage --seed 2026
+```
+
+**Shard unlearning** of a GUTS run
+
+```bash
+python guts/static_graph/unlearn.py --run_dir Results/shard-runs/Cora/<run> \
+    --forget_set processed/forget_sets/Cora/Node/forget_node_seed2026_0.5pct.json
+```
+
+The test prediction averages the softmax outputs of all shard models (accuracy and macro F1).
+Unlearning retrains the affected shards without the deleted nodes or edges, keeps the other
+shard models, and evaluates on the clean graph built in memory. For the retraining baselines,
+build the clean graph with `cora_data.py clean --data_path <split file> --forget_set <forget_set>.json`
+and pass it as `--data_path` to `pipeline.py` (Shard-Retrain) or `full_graph.py` (Full-Retrain).
+Results are written to `Results/{shard-runs,runs,shard-unlearns}/Cora/<run>/`.
 
 ## Configuration
 
@@ -174,11 +175,12 @@ Main keys of `configs/*.yaml`, with their symbols in the paper:
 | `partition.num_shards` | number of shards K |
 | `partition.epsilon` | KaHyPar node-imbalance tolerance ε |
 | `partition.di_alpha`, `di_beta` | weights α, β of TF and UC\* in the Deletion Influence |
-| `partition.refine_epsilon` | shard-size limit during Boundary Refinement |
+| `partition.refine_epsilon` | shard-size limit during Boundary Refinement: (1 + `refine_epsilon`) × the average shard size of the day (1.0 = twice the average) |
 | `partition.lambda_di`, `lambda_c`, `lambda_l` | refinement weights λ<sub>DI</sub>, λ<sub>C</sub>, λ<sub>ℓ</sub> (0 turns a term off) |
 | `partition.use_temporal_subgraph_assignment` | Temporal Subgraph Assignment |
 | `temporal_graph.window_size` | days merged into a target day's graph |
-| `training.*` | per-shard model and training hyperparameters |
+| `training.seed` | run seed (random when absent) |
+| `training.*` | per-shard model and training hyperparameters (YJMob) |
 
 Any key can be overridden on the command line:
 

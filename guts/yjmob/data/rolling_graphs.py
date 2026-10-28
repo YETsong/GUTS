@@ -22,7 +22,7 @@ from typing import List
 
 import torch
 
-from guts.utils import ensure_dir
+from guts.method.utils import ensure_dir
 
 FEATURE_NAMES = ["visit_count", "in_count", "out_count", "unique_in", "unique_out", "dwell_time"]
 _VISIT_COL = 0

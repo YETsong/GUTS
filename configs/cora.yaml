@@ -17,7 +17,7 @@ partition:
 
   # boundary refinement
   use_boundary_refinement: true
-  refine_epsilon: 0.05
+  refine_epsilon: 1.0
   refine_max_passes: 20
   refine_candidate_max_ratio: 0.50
   lambda_di: 0.0
@@ -27,6 +27,9 @@ partition:
 
   # it does not work even when the true option is used, because the static graph has no temporal
   use_temporal_subgraph_assignment: true
+
+training:
+  seed: 2026
 
 output:
   root: "Results/shard-runs/Cora"

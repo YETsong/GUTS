@@ -8,15 +8,18 @@ Steps:
   3. Each user's sessions are split chronologically 70/10/20 into train/val/test.
   4. One graph per day from the train sessions only (edges = cell transitions,
      weighted by count; six log1p node features).
-  5. The train sessions grouped by day (train_paths/): the trajectory hyperedges and
+  5. The train sessions grouped by day (train_trajs/): the traj hyperedges and
      their users read by the GUTS partitioner.
 
 Outputs under <out_root>/processed/<out_name>/: sequences/{train,val,test}/part_*.pt,
-daily_graphs/day_XXXX.pt, train_paths/{meta.pkl,day_XXXX.pkl},
+daily_graphs/day_XXXX.pt, train_trajs/{meta.pkl,day_XXXX.pkl},
 next_location_meta.{pt,json}, grid_info.pickle.
 
 The --exclude_*_from options build the clean data for retraining after a deletion;
-its train_paths then hold only the remaining sessions.
+its train_trajs then hold only the remaining sessions. With --stream, one clean
+dataset per step k (<out_name>/k001..) is built without the first k requests of a
+stream forget set, as unlearn_stream.py reads them; the CSVs are read once and
+finished steps are skipped.
 
 Example (the YJMob-14d data used by configs/yjmob_14d.yaml):
     python guts/yjmob/data/preprocess.py --dataset_name dataset1 \
@@ -29,6 +32,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -36,13 +40,13 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 import torch
-from tqdm import tqdm
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from guts.utils import ensure_dir, save_pickle
+from guts.method.reporting import output_row
+from guts.method.utils import ensure_dir, relpath_for_log, save_pickle
 
 
 DEFAULT_RAW_DIR = os.path.join(_REPO_ROOT, "processed", "yjmob", "raw")
@@ -81,7 +85,6 @@ def clear_previous_build_outputs(out_dir: str) -> None:
         "day_index_train.pt",
         "day_index_val.pt",
         "day_index_test.pt",
-        "raw_unlearn_index.pkl",
     ):
         path = os.path.join(out_dir, name)
         if os.path.isfile(path):
@@ -152,7 +155,7 @@ def _resolve_column(df: pd.DataFrame, candidates: Sequence[str], name: str) -> s
 def _read_normalized_csv(
     path: str,
     chunksize: int,
-    exclude_uids: Optional[set] = None,
+    exclude_users: Optional[set] = None,
     day_range: Optional[Tuple[int, int]] = None,
 ) -> Iterable[pd.DataFrame]:
     """Read the CSV in chunks with columns renamed to uid/day/time/x/y, after the
@@ -167,8 +170,8 @@ def _read_normalized_csv(
         out.columns = ["uid", "day", "time", "x", "y"]
         # int32 is enough for YJMob (uid < 1e5, day < 75, time < 48, x/y <= 200) and halves memory.
         out = out.astype({"uid": "int32", "day": "int32", "time": "int32", "x": "int32", "y": "int32"})
-        if exclude_uids:
-            out = out[~out["uid"].isin(exclude_uids)]
+        if exclude_users:
+            out = out[~out["uid"].isin(exclude_users)]
         if day_range is not None:
             lo, hi = day_range
             out = out[(out["day"] >= lo) & (out["day"] <= hi)]
@@ -178,7 +181,7 @@ def _read_normalized_csv(
 def infer_ranges(
     csv_paths: List[str],
     chunksize: int,
-    exclude_uids: Optional[set] = None,
+    exclude_users: Optional[set] = None,
     fixed_bounds: Optional[Dict] = None,
     day_range: Optional[Tuple[int, int]] = None,
 ) -> Dict:
@@ -189,7 +192,7 @@ def infer_ranges(
     rows = 0
     users = set()
     for path in csv_paths:
-        for chunk in tqdm(_read_normalized_csv(path, chunksize, exclude_uids, day_range), desc=f"infer:{os.path.basename(path)}"):
+        for chunk in _read_normalized_csv(path, chunksize, exclude_users, day_range):
             if chunk.empty:
                 continue
             rows += int(len(chunk))
@@ -325,12 +328,12 @@ def apply_deletion_to_session(
     min_compressed_len: int,
     exclude_node_ids: Optional[set] = None,
     exclude_edges: Optional[set] = None,
-    exclude_paths: Optional[set] = None,
+    exclude_trajs: Optional[set] = None,
 ) -> List[Session]:
     """Apply a deletion to one session whose split is already fixed: drop it (path),
     remove deleted cells (node), or cut it at deleted transitions (edge). The pieces
     are recompressed; short ones are dropped."""
-    if exclude_paths and (sess.uid, sess.day, sess.start_time, sess.end_time) in exclude_paths:
+    if exclude_trajs and (sess.uid, sess.day, sess.start_time, sess.end_time) in exclude_trajs:
         return []
     cells, times = list(sess.raw_cells), list(sess.raw_times)
     if exclude_node_ids:
@@ -387,6 +390,53 @@ def add_train_session_to_graph(
             counter[(int(src), int(dst))] += 1
 
 
+def iter_user_records(
+    csv_paths: List[str],
+    ranges: Dict,
+    chunksize: int,
+    exclude_users: Optional[set] = None,
+    day_range: Optional[Tuple[int, int]] = None,
+) -> Iterable[pd.DataFrame]:
+    """Yield each user's records (with node_id) in CSV order.
+
+    The CSV must be ordered by uid: only the last uid of a chunk is carried into the
+    next chunk, so a uid whose rows are not contiguous would be split in two; that
+    stops with an error. The YJMob CSVs are ordered by uid."""
+    seen_uids: set = set()
+
+    def checked(user_df: pd.DataFrame) -> pd.DataFrame:
+        uid = int(user_df["uid"].iloc[0])
+        if uid in seen_uids:
+            raise ValueError(
+                f"uid {uid} appears again after its rows were processed: the CSV must be "
+                "ordered by uid (sort it by uid, then day and time, and rerun)."
+            )
+        seen_uids.add(uid)
+        return user_df
+
+    carry = pd.DataFrame()
+    for path in csv_paths:
+        for chunk in _read_normalized_csv(path, chunksize, exclude_users, day_range):
+            if chunk.empty:
+                continue
+            chunk = chunk.copy()
+            chunk["node_id"] = node_ids_from_xy(chunk, ranges["x_min"], ranges["y_min"], ranges["y_size"])
+            if not carry.empty:
+                chunk = pd.concat([carry, chunk], ignore_index=True)
+                carry = pd.DataFrame()
+            chunk.sort_values(["uid", "day", "time"], inplace=True, kind="mergesort")
+            last_uid = int(chunk["uid"].iloc[-1])
+            complete = chunk[chunk["uid"] != last_uid]
+            carry = chunk[chunk["uid"] == last_uid].copy()
+            for _, user_df in complete.groupby("uid", sort=False):
+                if not user_df.empty:
+                    yield checked(user_df)
+    if not carry.empty:
+        for _, user_df in carry.groupby("uid", sort=False):
+            if not user_df.empty:
+                yield checked(user_df)
+
+
 def process_csvs(
     csv_paths: List[str],
     out_dir: str,
@@ -395,13 +445,35 @@ def process_csvs(
     session_gap: int,
     min_compressed_len: int,
     max_sessions_per_part: int,
-    exclude_uids: Optional[set] = None,
+    exclude_users: Optional[set] = None,
     day_range: Optional[Tuple[int, int]] = None,
     exclude_node_ids: Optional[set] = None,
     exclude_edges: Optional[set] = None,
-    exclude_paths: Optional[set] = None,
+    exclude_trajs: Optional[set] = None,
 ) -> Dict:
-    """Stream the CSVs, write the sequence parts and daily graphs, and save the meta."""
+    """Stream the CSVs and write the dataset (sequence parts, daily graphs, meta)."""
+    user_sessions = (
+        split_user_sessions(user_df, session_gap=session_gap, min_compressed_len=min_compressed_len)
+        for user_df in iter_user_records(csv_paths, ranges, chunksize, exclude_users, day_range)
+    )
+    return write_dataset(out_dir, user_sessions, ranges, min_compressed_len, max_sessions_per_part,
+                         exclude_users, exclude_node_ids, exclude_edges, exclude_trajs)
+
+
+def write_dataset(
+    out_dir: str,
+    user_sessions: Iterable[List[Session]],
+    ranges: Dict,
+    min_compressed_len: int,
+    max_sessions_per_part: int,
+    exclude_users: Optional[set] = None,
+    exclude_node_ids: Optional[set] = None,
+    exclude_edges: Optional[set] = None,
+    exclude_trajs: Optional[set] = None,
+) -> Dict:
+    """Write sequence parts, daily graphs, meta and train_trajs from each user's sessions
+    (before deletion, in user order; users of exclude_users already left out). Splits are
+    decided on these sessions, then node / edge / traj deletions are applied per session."""
     ensure_dir(out_dir)
     clear_previous_build_outputs(out_dir)
     writers = {
@@ -417,32 +489,17 @@ def process_csvs(
     split_session_counts = Counter()
     split_step_counts = Counter()
     user_count = 0
+    deletion_mode = bool(exclude_node_ids or exclude_edges or exclude_trajs)
 
-    carry = pd.DataFrame()
-    seen_uids: set = set()
-
-    def process_user(user_df: pd.DataFrame) -> None:
-        nonlocal user_count
-        if user_df.empty:
-            return
-        uid = int(user_df["uid"].iloc[0])
-        if uid in seen_uids:
-            raise ValueError(
-                f"uid {uid} appears again after its rows were processed: the CSV must be "
-                "ordered by uid (sort it by uid, then day and time, and rerun)."
-            )
-        seen_uids.add(uid)
+    for sessions in user_sessions:
         user_count += 1
+        total = len(sessions)
         if deletion_mode:
-            base = split_user_sessions(user_df, session_gap=session_gap, min_compressed_len=min_compressed_len)
-            total = len(base)
             labeled = [(split_name_for_session_index(idx, total), piece)
-                       for idx, sess in enumerate(base)
+                       for idx, sess in enumerate(sessions)
                        for piece in apply_deletion_to_session(sess, min_compressed_len, exclude_node_ids,
-                                                              exclude_edges, exclude_paths)]
+                                                              exclude_edges, exclude_trajs)]
         else:
-            sessions = split_user_sessions(user_df, session_gap=session_gap, min_compressed_len=min_compressed_len)
-            total = len(sessions)
             labeled = [(split_name_for_session_index(idx, total), sess) for idx, sess in enumerate(sessions)]
         for split, sess in labeled:
             writers[split].add(sess)
@@ -450,29 +507,6 @@ def process_csvs(
             split_step_counts[split] += max(0, len(sess.cells) - 1)
             if split == "train":
                 add_train_session_to_graph(sess, visit_counts, dwell_sums, edge_counts_by_day)
-
-    deletion_mode = bool(exclude_node_ids or exclude_edges or exclude_paths)
-    # The CSV must be ordered by uid: only the last uid of a chunk is carried into
-    # the next chunk, so a uid whose rows are not contiguous would be split in two.
-    # process_user() stops with an error in that case. The YJMob CSVs are ordered by uid.
-    for path in csv_paths:
-        for chunk in tqdm(_read_normalized_csv(path, chunksize, exclude_uids, day_range), desc=f"process:{os.path.basename(path)}"):
-            if chunk.empty:
-                continue
-            chunk = chunk.copy()
-            chunk["node_id"] = node_ids_from_xy(chunk, ranges["x_min"], ranges["y_min"], ranges["y_size"])
-            if not carry.empty:
-                chunk = pd.concat([carry, chunk], ignore_index=True)
-                carry = pd.DataFrame()
-            chunk.sort_values(["uid", "day", "time"], inplace=True, kind="mergesort")
-            last_uid = int(chunk["uid"].iloc[-1])
-            complete = chunk[chunk["uid"] != last_uid]
-            carry = chunk[chunk["uid"] == last_uid].copy()
-            for _, user_df in complete.groupby("uid", sort=False):
-                process_user(user_df)
-    if not carry.empty:
-        for _, user_df in carry.groupby("uid", sort=False):
-            process_user(user_df)
 
     seq_index = {split: writer.finish() for split, writer in writers.items()}
 
@@ -482,7 +516,7 @@ def process_csvs(
     feature_names = ["visit_count", "in_count", "out_count", "unique_in", "unique_out", "dwell_time"]
     daily_index = []
 
-    for day in tqdm(ranges["days"], desc="save_daily_graphs"):
+    for day in ranges["days"]:
         day = int(day)
         edge_counter = edge_counts_by_day.get(day, Counter())
         feat = np.zeros((num_nodes, len(feature_names)), dtype=np.float32)
@@ -539,7 +573,7 @@ def process_csvs(
         "feature_names": feature_names,
         "split_policy": "per-user chronological sessions, 70/10/20",
         "deletion_split_policy": ("split decided on pre-deletion sessions; deletion applied per session "
-                                  "(original split preserved)") if (exclude_node_ids or exclude_edges or exclude_paths) else None,
+                                  "(original split preserved)") if (exclude_node_ids or exclude_edges or exclude_trajs) else None,
         "graph_policy": "day-wise train split transitions and train split raw visits only",
         "sequence_index": seq_index,
         "daily_graphs": daily_index,
@@ -549,25 +583,25 @@ def process_csvs(
             "split_sessions": {k: int(v) for k, v in split_session_counts.items()},
             "split_steps": {k: int(v) for k, v in split_step_counts.items()},
         },
-        "excluded_uids_count": int(len(exclude_uids)) if exclude_uids else 0,
+        "excluded_users_count": int(len(exclude_users)) if exclude_users else 0,
         "excluded_nodes_count": int(len(exclude_node_ids)) if exclude_node_ids else 0,
         "excluded_edges_count": int(len(exclude_edges)) if exclude_edges else 0,
-        "excluded_paths_count": int(len(exclude_paths)) if exclude_paths else 0,
+        "excluded_trajs_count": int(len(exclude_trajs)) if exclude_trajs else 0,
     }
     torch.save(meta, os.path.join(out_dir, "next_location_meta.pt"))
     with open(os.path.join(out_dir, "next_location_meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2, default=str)
     save_pickle(meta["grid_info"], os.path.join(out_dir, "grid_info.pickle"))
-    write_train_paths(out_dir)
+    write_train_trajs(out_dir)
     return meta
 
 
-TRAIN_PATHS_DIR = "train_paths"
+TRAIN_TRAJS_DIR = "train_trajs"
 
 
-def write_train_paths(out_dir: str) -> Dict:
-    """Group the train sessions (sequences/train) by day into train_paths/day_XXXX.pkl,
-    each a list of {"uid", "nodes"} in session order, plus train_paths/meta.pkl with the
+def write_train_trajs(out_dir: str) -> Dict:
+    """Group the train sessions (sequences/train) by day into train_trajs/day_XXXX.pkl,
+    each a list of {"uid", "nodes"} in session order, plus train_trajs/meta.pkl with the
     day files relative to that directory. The partitioner turns each session into one
     hyperedge, so the hyperedges always match the training data, including clean builds."""
     meta = torch.load(os.path.join(out_dir, "next_location_meta.pt"), map_location="cpu")
@@ -576,21 +610,86 @@ def write_train_paths(out_dir: str) -> Dict:
         for sess in torch.load(os.path.join(out_dir, part["path"]), map_location="cpu"):
             by_day[int(sess["day"])].append({"uid": int(sess["uid"]), "nodes": list(sess["cells"])})
 
-    paths_dir = ensure_dir(os.path.join(out_dir, TRAIN_PATHS_DIR))
+    trajs_dir = ensure_dir(os.path.join(out_dir, TRAIN_TRAJS_DIR))
     day_files: Dict[int, str] = {}
     for day in sorted(by_day):
         name = f"day_{day:04d}.pkl"
-        save_pickle(by_day[day], os.path.join(paths_dir, name))
+        save_pickle(by_day[day], os.path.join(trajs_dir, name))
         day_files[day] = name
-    paths_meta = {
+    trajs_meta = {
         "day_files": day_files,
-        "num_paths": int(sum(len(v) for v in by_day.values())),
+        "num_trajs": int(sum(len(v) for v in by_day.values())),
     }
-    save_pickle(paths_meta, os.path.join(paths_dir, "meta.pkl"))
-    return paths_meta
+    save_pickle(trajs_meta, os.path.join(trajs_dir, "meta.pkl"))
+    return trajs_meta
 
 
-def parse_args() -> argparse.Namespace:
+def _load_records(path: str) -> list:
+    with open(path) as f:
+        return json.load(f)["records"]
+
+
+def _exclusions(records: Dict[str, list]) -> Dict[str, Optional[set]]:
+    """Deletion targets of each forget-set type (None when the type is not given)."""
+    return {
+        "users": {int(r["uid"]) for r in records["users"]} if "users" in records else None,
+        "nodes": {int(r["nid"]) for r in records["nodes"]} if "nodes" in records else None,
+        "edges": {(int(r["src"]), int(r["dst"])) for r in records["edges"]} if "edges" in records else None,
+        "trajs": ({(int(r["uid"]), int(r["day"]), int(r["start_time"]), int(r["end_time"])) for r in records["trajs"]}
+                  if "trajs" in records else None),
+    }
+
+
+def _counts_line(meta: dict) -> str:
+    c = meta["counts"]
+    sess = c["split_sessions"]
+    return (f"users {c['users_seen']:,}   sessions  train {sess['train']:,}   "
+            f"val {sess['val']:,}   test {sess['test']:,}")
+
+
+def _scan_line(ranges: Dict) -> str:
+    return (f"{ranges['rows']:,} rows   {ranges['num_users']:,} users   days {ranges['day_min']}-{ranges['day_max']}"
+            f"   grid {ranges['x_size']} x {ranges['y_size']}")
+
+
+def build_stream(csv_paths: List[str], out_dir: str, key: str, records: list, fixed_bounds: Dict,
+                 day_range: Optional[Tuple[int, int]], args: argparse.Namespace) -> None:
+    """Build <out_dir>/k001..kNNN, step k without the first k records, reading the CSVs once.
+
+    Every user's sessions are kept in memory with its row count and day range; each step
+    drops the deleted users and recomputes the row, user and day counts from them, so a
+    step equals a separate build with the first k records. Finished steps are skipped."""
+    todo = []
+    for k in range(1, len(records) + 1):
+        step_dir = os.path.join(out_dir, f"k{k:03d}")
+        if not os.path.exists(os.path.join(step_dir, "next_location_meta.pt")):
+            todo.append((k, step_dir))
+    if len(todo) < len(records):
+        print(output_row("stream", f"{len(records) - len(todo)}/{len(records)} steps already built"), flush=True)
+    if not todo:
+        return
+
+    t0 = time.time()
+    base_ranges = infer_ranges(csv_paths, chunksize=args.chunksize, fixed_bounds=fixed_bounds, day_range=day_range)
+    users = []  # (uid, rows, first day, last day, sessions)
+    for user_df in iter_user_records(csv_paths, base_ranges, args.chunksize, None, day_range):
+        users.append((int(user_df["uid"].iloc[0]), len(user_df), int(user_df["day"].min()), int(user_df["day"].max()),
+                      split_user_sessions(user_df, session_gap=args.session_gap, min_compressed_len=args.min_compressed_len)))
+    print(output_row("scan", f"{_scan_line(base_ranges)}   ({time.time() - t0:.0f}s)"), flush=True)
+    print(output_row("stream", f"building {len(todo)} steps (step k: first k {key} removed)"), flush=True)
+
+    for k, step_dir in todo:
+        excl = _exclusions({key: records[:k]})
+        kept = [u for u in users if not excl["users"] or u[0] not in excl["users"]]
+        day_min, day_max = min(u[2] for u in kept), max(u[3] for u in kept)
+        ranges = dict(base_ranges, rows=sum(u[1] for u in kept), num_users=len(kept),
+                      day_min=day_min, day_max=day_max, days=list(range(day_min, day_max + 1)))
+        meta = write_dataset(step_dir, (u[4] for u in kept), ranges, args.min_compressed_len, args.max_sessions_per_part,
+                             excl["users"], excl["nodes"], excl["edges"], excl["trajs"])
+        print(output_row(f"k{k:03d}", _counts_line(meta)), flush=True)
+
+
+def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Build the YJMob next-location dataset.")
     p.add_argument("--raw_dir", type=str, default=DEFAULT_RAW_DIR)
     p.add_argument("--dataset_name", type=str, default="dataset1")
@@ -605,25 +704,28 @@ def parse_args() -> argparse.Namespace:
                    help="keep days LO..HI")
     p.add_argument("--fixed_grid_info_from", type=str, default="",
                    help="original next_location_meta.pt; keeps node ids (clean builds)")
-    p.add_argument("--exclude_uids_from", type=str, default="", help="forget-set JSON: drop users")
+    p.add_argument("--exclude_users_from", type=str, default="", help="forget-set JSON: drop users")
     p.add_argument("--exclude_nodes_from", type=str, default="",
                    help="forget-set JSON: drop cells (needs --fixed_grid_info_from)")
     p.add_argument("--exclude_edges_from", type=str, default="", help="forget-set JSON: cut transitions")
-    p.add_argument("--exclude_paths_from", type=str, default="", help="forget-set JSON: drop sessions")
-    p.add_argument("--train_paths_only", action="store_true",
-                   help="only (re)write train_paths/ of an existing build")
-    return p.parse_args()
+    p.add_argument("--exclude_trajs_from", type=str, default="", help="forget-set JSON: drop trajs (sessions)")
+    p.add_argument("--stream", action="store_true",
+                   help="stream clean data: <out_name>/k001.. without the first k requests of the forget set")
+    p.add_argument("--train_trajs_only", action="store_true",
+                   help="only (re)write train_trajs/ of an existing build")
+    return p.parse_args(argv)
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv=None) -> None:
+    """argv: argument list (as on the command line); None reads sys.argv."""
+    args = parse_args(argv)
     out_name = args.out_name or _NEXT_LOCATION_OUT_NAME.get(args.dataset_name, f"{args.dataset_name}_Next_location")
     out_dir = os.path.join(args.out_root, "processed", out_name)
-    if args.train_paths_only:
-        paths_meta = write_train_paths(out_dir)
-        print(f"[DONE] {paths_meta['num_paths']} train paths written to {os.path.join(out_dir, TRAIN_PATHS_DIR)}")
+    if args.train_trajs_only:
+        trajs_meta = write_train_trajs(out_dir)
+        print(output_row("done", f"{trajs_meta['num_trajs']:,} train trajs -> {relpath_for_log(os.path.join(out_dir, TRAIN_TRAJS_DIR))}"),
+              flush=True)
         return
-    ensure_dir(out_dir)
 
     if args.csv_files is None:
         if args.dataset_name == "dataset1":
@@ -638,13 +740,6 @@ def main() -> None:
     for path in csv_paths:
         if not os.path.exists(path):
             raise FileNotFoundError(path)
-    exclude_uids: Optional[set] = None
-    if args.exclude_uids_from:
-        with open(args.exclude_uids_from) as f:
-            forget_set = json.load(f)
-        exclude_uids = {int(r["uid"]) for r in forget_set["records"]}
-        print(f"[EXCLUDE] {len(exclude_uids)} uid(s) from {args.exclude_uids_from} will be removed before any processing")
-
     fixed_bounds: Optional[Dict] = None
     if args.fixed_grid_info_from:
         orig_meta = torch.load(args.fixed_grid_info_from, map_location="cpu")
@@ -653,58 +748,56 @@ def main() -> None:
             "x_min": gi["x_min"], "x_max": gi["x_max"],
             "y_min": gi["y_min"], "y_max": gi["y_max"],
         }
-        print(f"[FIXED-GRID] x/y bounds forced from {args.fixed_grid_info_from}: {fixed_bounds}")
+    if args.exclude_nodes_from and not fixed_bounds:
+        raise ValueError("--exclude_nodes_from requires --fixed_grid_info_from (node ids must match the original grid mapping).")
 
     day_range: Optional[Tuple[int, int]] = None
     if args.day_range is not None:
         day_range = (int(args.day_range[0]), int(args.day_range[1]))
-        print(f"[DAY-RANGE] only day {day_range[0]}..{day_range[1]} rows will be used")
 
-    exclude_node_ids: Optional[set] = None
-    if args.exclude_nodes_from:
-        if not fixed_bounds:
-            raise ValueError("--exclude_nodes_from requires --fixed_grid_info_from (node ids must match the original grid mapping).")
-        with open(args.exclude_nodes_from) as f:
-            forget_set = json.load(f)
-        exclude_node_ids = {int(r["nid"]) for r in forget_set["records"]}
-        print(f"[EXCLUDE] {len(exclude_node_ids)} node(s) from {args.exclude_nodes_from} will be removed before any processing")
+    forget_sets = {key: _load_records(getattr(args, f"exclude_{key}_from"))
+                   for key in ("users", "nodes", "edges", "trajs") if getattr(args, f"exclude_{key}_from")}
+    print(f"preprocess  {args.dataset_name} -> {relpath_for_log(out_dir)}", flush=True)
+    options = ([f"days {day_range[0]}-{day_range[1]}"] if day_range else []) \
+        + [f"exclude {k} {len(v):,}" for k, v in forget_sets.items()] \
+        + ([f"grid from {relpath_for_log(args.fixed_grid_info_from)}"] if fixed_bounds else []) \
+        + (["stream"] if args.stream else [])
+    if options:
+        print(output_row("options", "   ".join(options)), flush=True)
 
-    exclude_edges: Optional[set] = None
-    if args.exclude_edges_from:
-        with open(args.exclude_edges_from) as f:
-            forget_set = json.load(f)
-        exclude_edges = {(int(r["src"]), int(r["dst"])) for r in forget_set["records"]}
-        print(f"[EXCLUDE] {len(exclude_edges)} edge(s) from {args.exclude_edges_from} will cut sessions at that transition")
+    def build(build_dir: str, records: Dict[str, list]) -> None:
+        exclusions = _exclusions(records)
+        t0 = time.time()
+        ranges = infer_ranges(csv_paths, chunksize=args.chunksize, exclude_users=exclusions["users"],
+                              fixed_bounds=fixed_bounds, day_range=day_range)
+        print(output_row("scan", f"{_scan_line(ranges)}   ({time.time() - t0:.0f}s)"), flush=True)
+        meta = process_csvs(
+            csv_paths=csv_paths,
+            out_dir=ensure_dir(build_dir),
+            ranges=ranges,
+            chunksize=args.chunksize,
+            session_gap=args.session_gap,
+            min_compressed_len=args.min_compressed_len,
+            max_sessions_per_part=args.max_sessions_per_part,
+            exclude_users=exclusions["users"],
+            day_range=day_range,
+            exclude_node_ids=exclusions["nodes"],
+            exclude_edges=exclusions["edges"],
+            exclude_trajs=exclusions["trajs"],
+        )
+        print(output_row("done", f"{_counts_line(meta)}   ({time.time() - t0:.0f}s)"), flush=True)
 
-    exclude_paths: Optional[set] = None
-    if args.exclude_paths_from:
-        with open(args.exclude_paths_from) as f:
-            forget_set = json.load(f)
-        exclude_paths = {(int(r["uid"]), int(r["day"]), int(r["start_time"]), int(r["end_time"]))
-                          for r in forget_set["records"]}
-        print(f"[EXCLUDE] {len(exclude_paths)} path(s) from {args.exclude_paths_from} will be removed entirely")
+    if not args.stream:
+        build(out_dir, forget_sets)
+        return
 
-    print(f"[BUILD] output={out_dir}")
-    ranges = infer_ranges(csv_paths, chunksize=args.chunksize, exclude_uids=exclude_uids,
-                           fixed_bounds=fixed_bounds, day_range=day_range)
-    print(f"[RANGE] rows={ranges['rows']} users={ranges['num_users']} nodes={ranges['num_nodes']} days={ranges['day_min']}..{ranges['day_max']}")
-    meta = process_csvs(
-        csv_paths=csv_paths,
-        out_dir=out_dir,
-        ranges=ranges,
-        chunksize=args.chunksize,
-        session_gap=args.session_gap,
-        min_compressed_len=args.min_compressed_len,
-        max_sessions_per_part=args.max_sessions_per_part,
-        exclude_uids=exclude_uids,
-        day_range=day_range,
-        exclude_node_ids=exclude_node_ids,
-        exclude_edges=exclude_edges,
-        exclude_paths=exclude_paths,
-    )
-    print("[DONE] next-location dataset saved")
-    print(json.dumps(meta["counts"], indent=2))
-
+    # Stream clean data: <out_name>/k001..kNNN, step k without the first k requests of the forget set.
+    if len(forget_sets) != 1:
+        raise ValueError("--stream needs exactly one --exclude_*_from (the stream forget set)")
+    if not fixed_bounds:
+        raise ValueError("--stream needs --fixed_grid_info_from (every step keeps the original node ids)")
+    (key, records), = forget_sets.items()
+    build_stream(csv_paths, out_dir, key, records, fixed_bounds, day_range, args)
 
 if __name__ == "__main__":
     main()

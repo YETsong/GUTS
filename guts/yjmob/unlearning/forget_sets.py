@@ -1,3 +1,17 @@
+"""Build yjmob forget sets (node / edge / user / traj) from the original train sessions.
+
+Each train session is one traj. Targets are drawn stratified by a per-type measure
+(node out-degree, edge weight, user traj count, traj length) with the stratum bounds
+read from a strata file:
+
+  strata  compute quartile bounds of each measure on a dataset and save the strata file
+  batch   one forget set per percentage:  <out_root>/<Type>/forget_<type>_seed<S>_<P>pct.json
+  stream  n targets in shuffled order for unlearn_stream.py:  .../forget_<type>_seed<S>_n<N>_stream.json
+
+Unlearning and the clean data build read only the target keys of each record
+(uid / nid / src, dst / uid, day, start_time, end_time); the other fields describe the target.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -5,490 +19,291 @@ import json
 import math
 import os
 import random
-import re
 import sys
 from collections import defaultdict
-from typing import Dict, Optional, Set, Tuple
+from typing import Callable, Dict, List, Tuple
 
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
+import numpy as np
+import torch
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.abspath(os.path.join(_HERE, "../../.."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from guts.yjmob.unlearning.raw_index import RawUnlearnIndex
+from guts.method.forget_sampling import NUM_STRATA, quartile_bounds, sample_from_strata, stratum_labels, stratum_of  # noqa: E402
+from guts.method.reporting import output_row  # noqa: E402
+from guts.method.utils import relpath_for_log, repo_relpath, resolve_seed  # noqa: E402
 
-
-# Node: 0.5%, 1%, 5% (main) + 10% (stress)
-NODE_RATIOS = [0.005, 0.01, 0.05, 0.10]
-
-NODE_FIXED_COUNTS = [10, 15, 20, 25, 30]
-
-# Edge: 0.05%, 0.1%, 0.5% (main) + 1%, 5% (stress)
-EDGE_RATIOS = [0.0005, 0.001, 0.005, 0.01, 0.05]
-
-EDGE_FIXED_COUNTS = [1000, 1500, 2000, 2500, 3000]
-
-# User: 0.5%, 1%, 5% (main) + 10% (stress)
-UID_RATIOS = [0.005, 0.01, 0.05, 0.10]
-
-UID_FIXED_COUNTS = [1, 10, 15, 20, 25]
-
-DAY_COUNTS = [1, 2, 3, 4, 5, 7, "top7", "vol10pct"]
-
-# Path: 0.5%, 1%, 5% (main) + 10% (stress)
-PATH_RATIOS = [0.005, 0.01, 0.05, 0.10]
-
-PATH_FIXED_COUNTS = [100, 110, 120, 130, 140]
+DIR_NAMES = {"node": "Node", "edge": "Edge", "user": "User", "traj": "Traj"}
+STREAM_TYPES = ("user", "node", "traj")  # types unlearn_stream.py supports
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stratified sampling helpers
+# Train session index
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _degree_bucket(degree: int) -> str:
-    if degree <= 4:
-        return "1-4"
-    if degree <= 49:
-        return "5-49"
-    if degree <= 499:
-        return "50-499"
-    return "500+"
+class TrainSessionIndex:
+    """Users, cells (nodes) and transitions (edges) mapped to the trajs containing them.
+
+    Traj ids follow the part file order and the session order inside each part.
+    """
+
+    def __init__(self, source_dir: str) -> None:
+        train_dir = os.path.join(source_dir, "sequences", "train")
+        if not os.path.isdir(train_dir):
+            raise FileNotFoundError(f"{relpath_for_log(train_dir)} not found — source_dir must be a preprocessed dataset")
+        self.traj_meta: Dict[int, dict] = {}
+        user_to_trajs: Dict[int, List[int]] = defaultdict(list)
+        node_to_trajs: Dict[int, List[int]] = defaultdict(list)
+        edge_to_trajs: Dict[Tuple[int, int], List[int]] = defaultdict(list)
+        traj_id = 0
+        for fname in sorted(f for f in os.listdir(train_dir) if f.endswith(".pt")):
+            for sess in torch.load(os.path.join(train_dir, fname), map_location="cpu"):
+                uid = int(sess["uid"])
+                cells = [int(c) for c in sess["cells"]]
+                self.traj_meta[traj_id] = {
+                    "uid": uid, "day": int(sess["day"]),
+                    "start_time": int(sess["start_time"]), "end_time": int(sess["end_time"]),
+                    "cells": cells,
+                }
+                user_to_trajs[uid].append(traj_id)
+                for c in set(cells):
+                    node_to_trajs[c].append(traj_id)
+                for e in set(zip(cells[:-1], cells[1:])):
+                    edge_to_trajs[e].append(traj_id)
+                traj_id += 1
+        self.user_to_trajs = dict(user_to_trajs)
+        self.node_to_trajs = dict(node_to_trajs)
+        self.edge_to_trajs = dict(edge_to_trajs)
+        print(output_row("index", f"{len(self.traj_meta):,} train trajs   {len(self.user_to_trajs):,} users   "
+                         f"{len(self.node_to_trajs):,} nodes   {len(self.edge_to_trajs):,} edges"), flush=True)
+
+    def traj_edges(self, traj_id: int) -> List[Tuple[int, int]]:
+        """Transitions of a traj in order (repeats kept)."""
+        cells = self.traj_meta[traj_id]["cells"]
+        return list(zip(cells[:-1], cells[1:]))
+
+    def step_count(self, traj_ids: List[int]) -> int:
+        return sum(len(self.traj_meta[t]["cells"]) - 1 for t in traj_ids)
+
+    def node_out_degree(self) -> Dict[int, int]:
+        """Transitions leaving each cell, over all trajs."""
+        degree: Dict[int, int] = defaultdict(int)
+        for t in self.traj_meta:
+            for src, _ in self.traj_edges(t):
+                degree[src] += 1
+        return dict(degree)
+
+    def edge_weight(self) -> Dict[Tuple[int, int], int]:
+        """Occurrences of each transition, over all trajs."""
+        weight: Dict[Tuple[int, int], int] = defaultdict(int)
+        for t in self.traj_meta:
+            for e in self.traj_edges(t):
+                weight[e] += 1
+        return dict(weight)
 
 
-def _weight_bucket(weight: int) -> str:
-    if weight == 1:
-        return "1"
-    if weight <= 4:
-        return "2-4"
-    if weight <= 9:
-        return "5-9"
-    if weight <= 49:
-        return "10-49"
-    return "50+"
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-type pool, measure and record
+# ─────────────────────────────────────────────────────────────────────────────
+
+Spec = Tuple[list, Callable, Callable]  # (targets, measure(target) -> int, record(target, stratum) -> dict)
 
 
-def _uid_activity_bucket(sessions: int) -> str:
-    if sessions <= 30:
-        return "low"
-    if sessions <= 60:
-        return "mid"
-    if sessions <= 90:
-        return "high"
-    return "very_high"
+def _node_spec(idx: TrainSessionIndex) -> Spec:
+    degree = idx.node_out_degree()
+
+    def record(nid, stratum):
+        trajs = idx.node_to_trajs[nid]
+        return {"nid": nid, "out_degree": degree.get(nid, 0), "stratum": stratum,
+                "affected_traj_count": len(trajs), "affected_step_count": idx.step_count(trajs)}
+    return list(idx.node_to_trajs), lambda nid: degree.get(nid, 0), record
 
 
-def _path_length_bucket(length: int) -> str:
-    if length <= 5:
-        return "short"
-    if length <= 10:
-        return "medium"
-    if length <= 20:
-        return "long"
-    return "very_long"
+def _edge_spec(idx: TrainSessionIndex) -> Spec:
+    weight = idx.edge_weight()
+
+    def record(edge, stratum):
+        trajs = idx.edge_to_trajs[edge]
+        return {"src": edge[0], "dst": edge[1], "weight": weight[edge], "stratum": stratum,
+                "affected_traj_count": len(trajs), "affected_step_count": idx.step_count(trajs)}
+    return list(weight), lambda edge: weight[edge], record
 
 
-def _stratified_sample(pool: list, n: int, key_fn, rng: random.Random) -> list:
-    if n >= len(pool):
-        return list(pool)
-    buckets: Dict[str, list] = defaultdict(list)
+def _user_spec(idx: TrainSessionIndex) -> Spec:
+    def record(uid, stratum):
+        trajs = idx.user_to_trajs[uid]
+        nodes, edges = set(), set()
+        for t in trajs:
+            nodes.update(idx.traj_meta[t]["cells"])
+            edges.update(idx.traj_edges(t))
+        return {"uid": uid, "traj_count": len(trajs), "stratum": stratum, "step_count": idx.step_count(trajs),
+                "affected_node_count": len(nodes), "affected_edge_count": len(edges)}
+    return list(idx.user_to_trajs), lambda uid: len(idx.user_to_trajs[uid]), record
+
+
+def _traj_spec(idx: TrainSessionIndex) -> Spec:
+    def record(traj_id, stratum):
+        m = idx.traj_meta[traj_id]
+        return {"uid": m["uid"], "day": m["day"], "start_time": m["start_time"], "end_time": m["end_time"],
+                "length": len(m["cells"]), "stratum": stratum,
+                "affected_node_count": len(set(m["cells"])), "affected_edge_count": len(set(idx.traj_edges(traj_id)))}
+    return list(idx.traj_meta), lambda traj_id: len(idx.traj_meta[traj_id]["cells"]), record
+
+
+SPECS = {"node": _node_spec, "edge": _edge_spec, "user": _user_spec, "traj": _traj_spec}
+MEASURES = {"node": "out_degree", "edge": "weight", "user": "traj_count", "traj": "length"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Strata
+# ─────────────────────────────────────────────────────────────────────────────
+
+def resolve_strata_path(path: str) -> str:
+    """A bare file name lives next to this script."""
+    return path if os.path.dirname(path) else os.path.join(_HERE, path)
+
+
+def load_strata(path: str, source_dir: str, types: List[str]) -> dict:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"strata file not found: {relpath_for_log(path)} (create it with the 'strata' command)")
+    with open(path, encoding="utf-8") as f:
+        strata = json.load(f)
+    missing = [t for t in types if t not in strata.get("bounds", {})]
+    if missing:
+        raise ValueError(f"strata file {relpath_for_log(path)} has no bounds for {missing}")
+    # source_dir is stored relative to the repository root, so the file is portable.
+    if os.path.abspath(os.path.join(_REPO_ROOT, strata["source_dir"])) != os.path.abspath(source_dir):
+        print(f"[WARN] strata file was computed on {strata['source_dir']}, not on {relpath_for_log(source_dir)}; "
+              "using it anyway", flush=True)
+    return strata
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sampling
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _stratified(idx: TrainSessionIndex, forget_type: str, bounds: List[int]):
+    """(pool size, strata buckets, record(target) -> dict)."""
+    pool, measure, record = SPECS[forget_type](idx)
+    labels = stratum_labels(bounds)
+    stratum = {}
+    buckets: Dict[int, list] = defaultdict(list)
     for item in pool:
-        buckets[key_fn(item)].append(item)
-    return _sample_from_buckets(buckets, len(pool), n, rng)
+        s = stratum_of(measure(item), bounds)
+        stratum[item] = s
+        buckets[s].append(item)
+    return len(pool), buckets, lambda item: record(item, labels[stratum[item]])
 
 
-def _sample_from_buckets(buckets: Dict[str, list], pool_size: int, n: int, rng: random.Random) -> list:
-    result: list = []
-    result_set: set = set()
-    remaining = n
-    for bname, bpool in sorted(buckets.items()):
-        quota = max(1, round(n * len(bpool) / pool_size))
-        quota = min(quota, len(bpool), remaining)
-        sampled = rng.sample(bpool, quota)
-        result.extend(sampled)
-        result_set.update(sampled)
-        remaining -= quota
-
-    if remaining > 0:
-        bucket_list = list(buckets.values())
-        rng.shuffle(bucket_list)
-        for bpool in bucket_list:
-            if remaining <= 0:
-                break
-            k = min(len(bpool), remaining * 3 + 5)
-            for cand in rng.sample(bpool, k):
-                if cand not in result_set:
-                    result.append(cand)
-                    result_set.add(cand)
-                    remaining -= 1
-                    if remaining <= 0:
-                        break
-    return result[:n]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Per-type generators
-# ─────────────────────────────────────────────────────────────────────────────
-
-def gen_node_forget_sets(idx: RawUnlearnIndex, out_dir: str, seed: int) -> None:
-    rng = random.Random(seed)
-    all_nodes = list(idx.node_to_paths.keys())
-    node_degree = idx.node_out_degree()
-
-    buckets: Dict[str, list] = defaultdict(list)
-    for node in all_nodes:
-        buckets[_degree_bucket(node_degree.get(node, 0))].append(node)
-
+def _save(out_dir: str, fname: str, data: dict, size_label: str) -> None:
     os.makedirs(out_dir, exist_ok=True)
-
-    def _build_and_save(n: int, tag: str, ratio: Optional[float]) -> None:
-        chosen = _sample_from_buckets(buckets, len(all_nodes), n, rng)
-        records = []
-        for nid in chosen:
-            path_ids = idx.node_to_paths.get(nid, [])
-            records.append({
-                "nid": nid,
-                "out_degree": node_degree.get(nid, 0),
-                "degree_bucket": _degree_bucket(node_degree.get(nid, 0)),
-                "affected_path_ids": path_ids,
-                "affected_path_count": len(path_ids),
-                "affected_session_count": len(path_ids),
-                "affected_step_count": sum(
-                    max(0, len(idx.path_meta[pid]["cells"]) - 1)
-                    for pid in path_ids
-                ),
-            })
-        fname = f"forget_nodes_seed{seed}_{tag}.json"
-        _save(out_dir, fname, {
-            "forget_type": "node",
-            "ratio": ratio,
-            "target_count": len(chosen),
-            "seed": seed,
-            "records": records,
-        })
-
-    for ratio in NODE_RATIOS:
-        n = max(1, math.ceil(len(all_nodes) * ratio))
-        tag = f"ratio{ratio:.4f}".rstrip("0")
-        _build_and_save(n, tag, ratio)
-
-    for count in NODE_FIXED_COUNTS:
-        n = min(count, len(all_nodes))
-        _build_and_save(n, f"n{n}", None)
-
-
-def gen_edge_forget_sets(idx: RawUnlearnIndex, out_dir: str, seed: int) -> None:
-    rng = random.Random(seed)
-    edge_weight = idx.edge_weight()
-    all_edges = list(edge_weight.keys())
-
-    buckets: Dict[str, list] = defaultdict(list)
-    for e in all_edges:
-        buckets[_weight_bucket(edge_weight.get(e, 1))].append(e)
-
-    os.makedirs(out_dir, exist_ok=True)
-
-    def _build_and_save(n: int, tag: str, ratio: Optional[float]) -> None:
-        chosen = _sample_from_buckets(buckets, len(all_edges), n, rng)
-        records = []
-        for src, dst in chosen:
-            path_ids = idx.edge_to_paths.get((src, dst), [])
-            w = edge_weight.get((src, dst), 0)
-            records.append({
-                "src": src,
-                "dst": dst,
-                "weight": w,
-                "weight_bucket": _weight_bucket(edge_weight.get((src, dst), 1)),
-                "affected_path_ids": path_ids,
-                "affected_transition_occurrences": w,
-                "affected_session_count": len(path_ids),
-                "affected_step_count": sum(
-                    max(0, len(idx.path_meta[pid]["cells"]) - 1)
-                    for pid in path_ids
-                ),
-            })
-        fname = f"forget_edges_seed{seed}_{tag}.json"
-        _save(out_dir, fname, {
-            "forget_type": "edge",
-            "ratio": ratio,
-            "target_count": len(chosen),
-            "seed": seed,
-            "records": records,
-        })
-
-    for ratio in EDGE_RATIOS:
-        n = max(1, math.ceil(len(all_edges) * ratio))
-        tag = f"ratio{ratio:.5f}".rstrip("0")
-        _build_and_save(n, tag, ratio)
-
-    for count in EDGE_FIXED_COUNTS:
-        n = min(count, len(all_edges))
-        _build_and_save(n, f"n{n}", None)
-
-
-def gen_uid_forget_sets(idx: RawUnlearnIndex, out_dir: str, seed: int) -> None:
-    rng = random.Random(seed)
-    uid_stats = idx.uid_stats()
-    all_uids = list(uid_stats.keys())
-
-    buckets: Dict[str, list] = defaultdict(list)
-    for uid in all_uids:
-        buckets[_uid_activity_bucket(uid_stats[uid]["session_count"])].append(uid)
-
-    os.makedirs(out_dir, exist_ok=True)
-
-    def _build_and_save(n: int, tag: str, ratio: Optional[float]) -> None:
-        chosen = _sample_from_buckets(buckets, len(all_uids), n, rng)
-        records = []
-        for uid in chosen:
-            path_ids = idx.uid_to_paths.get(uid, [])
-            affected_nodes: Set[int] = set()
-            affected_edges: Set[Tuple[int, int]] = set()
-            for pid in path_ids:
-                affected_nodes.update(idx.path_meta[pid]["cells"])
-                affected_edges.update(idx.path_to_edges.get(pid, []))
-            records.append({
-                "uid": uid,
-                "session_count": uid_stats[uid]["session_count"],
-                "step_count": uid_stats[uid]["step_count"],
-                "path_ids": path_ids,
-                "affected_node_count": len(affected_nodes),
-                "affected_edge_count": len(affected_edges),
-            })
-        fname = f"forget_users_seed{seed}_{tag}.json"
-        _save(out_dir, fname, {
-            "forget_type": "uid",
-            "ratio": ratio,
-            "target_count": len(chosen),
-            "seed": seed,
-            "records": records,
-        })
-
-    for ratio in UID_RATIOS:
-        n = max(1, math.ceil(len(all_uids) * ratio))
-        tag = f"ratio{ratio:.4f}".rstrip("0")
-        _build_and_save(n, tag, ratio)
-
-    for count in UID_FIXED_COUNTS:
-        n = min(count, len(all_uids))
-        tag = f"n{n}"
-        _build_and_save(n, tag, None)
-
-
-def gen_day_forget_sets(idx: RawUnlearnIndex, out_dir: str, seed: int) -> None:
-    rng = random.Random(seed)
-    day_stats = idx.day_stats()
-    day_to_uids = idx.day_to_uid_set()
-
-    counts = sorted(s["session_count"] for s in day_stats.values())
-    threshold = counts[max(0, len(counts) // 10)]
-    candidate_days = [
-        d for d, s in day_stats.items()
-        if s["session_count"] > threshold
-    ]
-    total_train_sessions = sum(s["session_count"] for s in day_stats.values())
-
-    os.makedirs(out_dir, exist_ok=True)
-
-    for k in DAY_COUNTS:
-        if k == "top7":
-            chosen = sorted(
-                candidate_days,
-                key=lambda d: -day_stats[d]["session_count"]
-            )[:7]
-            tag = "top7"
-        elif k == "vol10pct":
-            target_volume = total_train_sessions * 0.10
-            ranked = sorted(
-                candidate_days,
-                key=lambda d: -day_stats[d]["session_count"]
-            )
-            chosen = []
-            cum = 0
-            for d in ranked:
-                if cum >= target_volume:
-                    break
-                chosen.append(d)
-                cum += day_stats[d]["session_count"]
-            tag = "vol10pct"
-        else:
-            # stratified: low/mid/high volume day
-            vol_bucket = lambda d: (
-                "low" if day_stats[d]["session_count"] <= counts[len(counts) // 3] else
-                "high" if day_stats[d]["session_count"] > counts[2 * len(counts) // 3] else
-                "mid"
-            )
-            chosen = _stratified_sample(candidate_days, int(k), vol_bucket, rng)
-            tag = f"k{k}"
-
-        records = []
-        for day in chosen:
-            path_ids = idx.day_to_paths.get(day, [])
-            affected_nodes: Set[int] = set()
-            affected_edges: Set[Tuple[int, int]] = set()
-            for pid in path_ids:
-                affected_nodes.update(idx.path_meta[pid]["cells"])
-                affected_edges.update(idx.path_to_edges.get(pid, []))
-            records.append({
-                "day": day,
-                "train_session_count": day_stats[day]["session_count"],
-                "train_step_count": day_stats[day]["step_count"],
-                "train_user_count": len(day_to_uids.get(day, set())),
-                "path_ids": path_ids,
-                "affected_node_count": len(affected_nodes),
-                "affected_edge_count": len(affected_edges),
-            })
-
-        fname = f"forget_days_seed{seed}_{tag}.json"
-        _save(out_dir, fname, {
-            "forget_type": "day",
-            "k": k,
-            "target_count": len(chosen),
-            "seed": seed,
-            "records": records,
-        })
-
-
-def gen_path_forget_sets(idx: RawUnlearnIndex, out_dir: str, seed: int) -> None:
-    rng = random.Random(seed)
-    all_pids = list(idx.path_meta.keys())
-
-    buckets: Dict[str, list] = defaultdict(list)
-    for pid in all_pids:
-        buckets[_path_length_bucket(len(idx.path_meta[pid]["cells"]))].append(pid)
-
-    os.makedirs(out_dir, exist_ok=True)
-
-    def _build_and_save(n: int, tag: str, ratio: Optional[float]) -> None:
-        chosen = _sample_from_buckets(buckets, len(all_pids), n, rng)
-        records = []
-        for pid in chosen:
-            m = idx.path_meta[pid]
-            affected_edges = idx.path_to_edges.get(pid, [])
-            records.append({
-                "path_id": pid,
-                "uid": m["uid"],
-                "day": m["day"],
-                "start_time": m["start_time"],
-                "end_time": m["end_time"],
-                "path_length": len(m["cells"]),
-                "path_length_bucket": _path_length_bucket(len(m["cells"])),
-                "node_sequence": m["cells"],
-                "edge_sequence": [list(e) for e in affected_edges],
-                "affected_node_count": len(set(m["cells"])),
-                "affected_edge_count": len(set(affected_edges)),
-            })
-        fname = f"forget_paths_seed{seed}_{tag}.json"
-        _save(out_dir, fname, {
-            "forget_type": "path",
-            "ratio": ratio,
-            "target_count": len(chosen),
-            "seed": seed,
-            "records": records,
-        })
-
-    for ratio in PATH_RATIOS:
-        n = max(1, math.ceil(len(all_pids) * ratio))
-        tag = f"ratio{ratio:.4f}".rstrip("0")
-        _build_and_save(n, tag, ratio)
-
-    for count in PATH_FIXED_COUNTS:
-        n = min(count, len(all_pids))
-        _build_and_save(n, f"n{n}", None)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-_COMPACT_LIST_FIELDS = ("affected_path_ids",)
-
-
-def _compact_id_list_field(json_text: str, field_name: str) -> str:
-    pattern = re.compile(
-        r'("' + re.escape(field_name) + r'": )\[\s*([^\[\]]*?)\s*\]',
-        re.DOTALL,
-    )
-
-    def _collapse(m: "re.Match[str]") -> str:
-        items = [x.strip() for x in m.group(2).split(",") if x.strip()]
-        return m.group(1) + "[" + ", ".join(items) + "]"
-
-    return pattern.sub(_collapse, json_text)
-
-
-def _save(out_dir: str, fname: str, data: dict) -> None:
     path = os.path.join(out_dir, fname)
-    text = json.dumps(data, indent=2, ensure_ascii=False)
-    for field_name in _COMPACT_LIST_FIELDS:
-        text = _compact_id_list_field(text, field_name)
     with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
-    print(f"  saved → {path}  (targets={data['target_count']})", flush=True)
+        json.dump(data, f, indent=2)
+    print(output_row(data["forget_type"], f"{size_label:<8}{data['target_count']:>8,} targets -> {relpath_for_log(path)}"),
+          flush=True)
+
+
+def generate_batch(idx, forget_type: str, bounds: List[int], percents: List[float], seed: int, out_root: str, strata_file: str) -> None:
+    """One forget set per percentage; each draws from a fresh RNG(seed), independent of the others."""
+    pool_size, buckets, record = _stratified(idx, forget_type, bounds)
+    for pct in percents:
+        n = max(1, math.ceil(pool_size * pct / 100))
+        chosen = sample_from_strata(buckets, pool_size, n, random.Random(seed))
+        _save(os.path.join(out_root, DIR_NAMES[forget_type]), f"forget_{forget_type}_seed{seed}_{pct:g}pct.json", {
+            "forget_type": forget_type, "percent": pct, "target_count": len(chosen), "seed": seed,
+            "strata": {"file": repo_relpath(strata_file), "measure": MEASURES[forget_type], "upper_bounds": bounds},
+            "records": [record(x) for x in chosen],
+        }, f"{pct:g}%")
+
+
+def generate_stream(idx, forget_type: str, bounds: List[int], n: int, seed: int, out_root: str, strata_file: str) -> None:
+    """n targets, stratified, then shuffled; unlearn_stream.py deletes them one at a time in this order."""
+    pool_size, buckets, record = _stratified(idx, forget_type, bounds)
+    rng = random.Random(seed)
+    chosen = sample_from_strata(buckets, pool_size, n, rng)
+    rng.shuffle(chosen)
+    _save(os.path.join(out_root, DIR_NAMES[forget_type]), f"forget_{forget_type}_seed{seed}_n{n}_stream.json", {
+        "forget_type": forget_type, "order": "shuffled", "target_count": len(chosen), "seed": seed,
+        "strata": {"file": repo_relpath(strata_file), "measure": MEASURES[forget_type], "upper_bounds": bounds},
+        "records": [record(x) for x in chosen],
+    }, f"n{n}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
-ALL_TYPES = ["node", "edge", "uid", "day", "path"]
-
-_DEFAULT_SOURCE_DIR = os.path.join(_REPO_ROOT, "processed", "yjmob_1")
-
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="GraphSAGE unlearning forget set generator (from the original data)",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    p.add_argument("--source_dir", default=_DEFAULT_SOURCE_DIR,
-                   help=f"original (unsharded) next-grid processed directory (default: {_DEFAULT_SOURCE_DIR})")
-    p.add_argument("--index_path", default="",
-                   help="RawUnlearnIndex cache (default: <source_dir>/raw_unlearn_index.pkl)")
-    p.add_argument("--out_root", default="",
-                   help="output root (default: processed/forget_sets/yjmob/)")
-    p.add_argument("--types", nargs="+", choices=ALL_TYPES, default=ALL_TYPES,
-                   help="forget set types to build (default: all)")
-    p.add_argument("--seed", type=int, default=2026)
-    p.add_argument("--rebuild_index", action="store_true",
-                   help="force rebuilding the index")
-    return p.parse_args()
+def compute_strata(idx: TrainSessionIndex, source_dir: str) -> dict:
+    bounds = {}
+    for t, spec in SPECS.items():
+        pool, measure, _ = spec(idx)
+        values = [measure(x) for x in pool]
+        bounds[t] = quartile_bounds(values)
+        counts = np.bincount([stratum_of(v, bounds[t]) for v in values], minlength=len(bounds[t]) + 1)
+        sizes = "   ".join(f"{lab} {100 * c / len(values):.1f}%" for lab, c in zip(stratum_labels(bounds[t]), counts))
+        print(output_row(t, f"{MEASURES[t]:<14}{sizes}"), flush=True)
+    return {"source_dir": os.path.relpath(os.path.abspath(source_dir), _REPO_ROOT), "method": f"quantile, {NUM_STRATA} strata (equal bounds merged)",
+            "measures": MEASURES, "bounds": bounds}
 
 
-def main() -> None:
-    args = parse_args()
+def parse_args(argv=None) -> argparse.Namespace:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--source_dir", default=os.path.join(_REPO_ROOT, "processed", "yjmob_1_14d"),
+                        help="original preprocessed dataset")
+    common.add_argument("--strata", default="strata.json",
+                        help="strata file (a bare file name is next to this script)")
+    sampling = argparse.ArgumentParser(add_help=False)
+    sampling.add_argument("--seed", type=int, default=None,
+                          help="sampling seed (default: random; it is part of the output file name)")
+    sampling.add_argument("--out_root", default=os.path.join(_REPO_ROOT, "processed", "forget_sets", "yjmob"))
 
-    index_path = args.index_path or os.path.join(args.source_dir, "raw_unlearn_index.pkl")
-    if os.path.exists(index_path) and not args.rebuild_index:
-        print(f"Loading existing index: {index_path}", flush=True)
-        idx = RawUnlearnIndex.load(index_path)
-    else:
-        print(f"Building index from: {args.source_dir}", flush=True)
-        idx = RawUnlearnIndex.build(args.source_dir)
-        idx.save(index_path)
+    p = argparse.ArgumentParser(description="Build yjmob forget sets.")
+    sub = p.add_subparsers(dest="command", required=True)
+    sub.add_parser("strata", parents=[common], help="compute and save the strata file")
+    batch = sub.add_parser("batch", parents=[common, sampling], help="forget sets by percentage")
+    batch.add_argument("--percent", type=float, nargs="+", default=[1.0],
+                       help="share of targets to delete, in percent (e.g. 0.05 1 10)")
+    batch.add_argument("--types", nargs="+", choices=list(SPECS), default=list(SPECS))
+    stream = sub.add_parser("stream", parents=[common, sampling], help="ordered forget sets for unlearn_stream.py")
+    stream.add_argument("--n", type=int, default=20, help="number of requests")
+    stream.add_argument("--types", nargs="+", choices=list(STREAM_TYPES), default=list(STREAM_TYPES))
+    return p.parse_args(argv)
 
-    print(f"Index summary: {idx.summary()}", flush=True)
 
-    out_root = args.out_root or os.path.join(_REPO_ROOT, "processed", "forget_sets", "yjmob")
+def main(argv=None) -> None:
+    """argv: argument list (as on the command line); None reads sys.argv."""
+    args = parse_args(argv)
+    source_dir = os.path.abspath(args.source_dir)
+    strata_path = resolve_strata_path(args.strata)
 
-    type_dir_map = {
-        "node": os.path.join(out_root, "Node"),
-        "edge": os.path.join(out_root, "Edge"),
-        "uid":  os.path.join(out_root, "Uid"),
-        "day":  os.path.join(out_root, "Day"),
-        "path": os.path.join(out_root, "Path"),
-    }
-    type_gen_map = {
-        "node": gen_node_forget_sets,
-        "edge": gen_edge_forget_sets,
-        "uid":  gen_uid_forget_sets,
-        "day":  gen_day_forget_sets,
-        "path": gen_path_forget_sets,
-    }
+    if args.command == "strata":
+        print(f"strata  source {relpath_for_log(source_dir)}", flush=True)
+        idx = TrainSessionIndex(source_dir)
+        strata = compute_strata(idx, source_dir)
+        with open(strata_path, "w", encoding="utf-8") as f:
+            json.dump(strata, f, indent=2)
+        print(output_row("done", f"-> {relpath_for_log(strata_path)}"), flush=True)
+        return
 
+    if args.command == "batch":
+        bad = [p for p in args.percent if not 0 < p <= 100]
+        if bad:
+            raise ValueError(f"--percent must be in (0, 100]: {bad}")
+    elif args.n < 1:
+        raise ValueError("--n must be at least 1")
+    strata = load_strata(strata_path, source_dir, args.types)
+    seed = resolve_seed(args.seed)
+    print(f"forget sets  {args.command}  seed {seed}" + (" (random)" if args.seed is None else "")
+          + f"  source {relpath_for_log(source_dir)}  strata {relpath_for_log(strata_path)}", flush=True)
+    idx = TrainSessionIndex(source_dir)
     for t in args.types:
-        print(f"\n=== Generating [{t}] forget sets ===", flush=True)
-        type_gen_map[t](idx, type_dir_map[t], args.seed)
-
-    print("\nDone.", flush=True)
+        if args.command == "batch":
+            generate_batch(idx, t, strata["bounds"][t], args.percent, seed, args.out_root, strata_path)
+        else:
+            generate_stream(idx, t, strata["bounds"][t], args.n, seed, args.out_root, strata_path)
 
 
 if __name__ == "__main__":

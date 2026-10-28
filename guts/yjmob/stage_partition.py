@@ -1,6 +1,6 @@
 """STEP 1 of guts/yjmob/pipeline.py: run the GUTS partitioner over the training days.
 
-The partitioning algorithm itself is guts/partition/partitioner.py; this file runs
+The partitioning algorithm itself is guts/method/partition/partitioner.py; this file runs
 it for yjmob: loads each day graph, fits the days in parallel processes, applies
 temporal subgraph assignment in day order, saves/reuses partition/day{N}.pkl
 (reused only when every day exists), builds the shard subgraphs and writes the
@@ -18,15 +18,56 @@ if _REPO_ROOT not in sys.path:
 
 import time
 from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass
 from typing import Dict, List
 
 import numpy as np
 import torch
 import torch.multiprocessing as mp
 
-from guts.partition.partitioner import make_partitioner
-from guts.shard import ShardBuilder, TemporalSample
-from guts.utils import compact_json, ensure_dir, relpath_for_log
+from guts.method.partition.partitioner import GUTSPartitioner
+from guts.method.shard import ShardBuilder
+from guts.method.utils import compact_json, ensure_dir, load_pickle, relpath_for_log, save_pickle
+from guts.yjmob.data.train_trajs import TrajectoryExtractor, load_grid_info
+
+
+@dataclass
+class TemporalSample:
+    """
+    Typed container for one day graph sample.
+
+    Field shapes:
+        x           : FloatTensor [num_nodes, in_dim]
+        edge_index  : LongTensor  [2, num_edges]
+        edge_weight : FloatTensor [num_edges]   (ones if absent)
+    """
+    day: int
+    x: torch.Tensor
+    edge_index: torch.Tensor
+    edge_weight: torch.Tensor
+
+    @property
+    def num_nodes(self) -> int:
+        return int(self.x.size(0))
+
+    @property
+    def num_edges(self) -> int:
+        return int(self.edge_index.size(1))
+
+    @property
+    def in_dim(self) -> int:
+        return int(self.x.size(1))
+
+
+def make_partitioner(cfg) -> GUTSPartitioner:
+    """GUTS partitioner for the yjmob days: KaHyPar seed training.seed, temporal subgraph
+    assignment over temporal_graph.window_size days on the grid of data.nextgrid_processed_dir."""
+    return GUTSPartitioner(
+        cfg.partition,
+        seed=int(cfg.training.seed),
+        window_size=cfg.temporal_graph.window_size,
+        grid_info=load_grid_info(cfg.data.nextgrid_processed_dir),
+    )
 
 
 def load_day_sample(source_processed_dir: str, day_id: int) -> TemporalSample:
@@ -37,7 +78,7 @@ def load_day_sample(source_processed_dir: str, day_id: int) -> TemporalSample:
         f"day_{int(day_id):04d}.pt",
     )
     if not os.path.exists(graph_path):
-        raise FileNotFoundError(f"Next-grid daily graph not found: {graph_path}")
+        raise FileNotFoundError(f"Next-grid daily graph not found: {relpath_for_log(graph_path)}")
     graph = torch.load(graph_path, map_location="cpu")
     x = graph["x"].float()
     edge_index = graph["edge_index"].long()
@@ -58,15 +99,16 @@ def _partition_fit_worker(args):
     cfg, day_id, nextgrid_source_dir = args
     partitioner = make_partitioner(cfg)
     sample = load_day_sample(nextgrid_source_dir, day_id)
+    tc = TrajectoryExtractor(cfg.data.nextgrid_processed_dir).extract(day_id)
     import contextlib
     import io
     _buf = io.StringIO()
     with contextlib.redirect_stdout(_buf):
-        partition, pc = partitioner.fit_unassigned(sample)
+        partition, tc = partitioner.fit_unassigned(sample, tc)
     for _line in _buf.getvalue().splitlines():
         if _line.strip():
             print(f"[day {day_id}] {_line}", flush=True)
-    return day_id, partition, pc, sample
+    return day_id, partition, tc, sample
 
 
 def source_days(source_processed_dir: str):
@@ -82,14 +124,11 @@ def source_days(source_processed_dir: str):
     return sorted(out)
 
 
-def step_build_day(partition, sample, log, day_id, verbose: bool = True):
-    """Build shard subgraphs for one day (no ghost nodes)."""
+def step_build_day(partition, sample):
+    """Build shard subgraphs for one day (no ghost nodes); returns them and the time in ms."""
     t0 = time.time()
     shards = ShardBuilder().build(partition, sample)
-    elapsed_ms = round((time.time() - t0) * 1000)
-    if verbose:
-        log(f"  [day {day_id}] shards built: {len(shards)} shards  {time.time()-t0:.1f}s")
-    return shards, elapsed_ms
+    return shards, round((time.time() - t0) * 1000)
 
 
 def _save_refinement_metrics(sharding_dir: str, partitions: dict, cfg) -> dict:
@@ -138,8 +177,8 @@ def _save_refinement_metrics(sharding_dir: str, partitions: dict, cfg) -> dict:
             aggregate[f"{key}_total"] = sum(values)
             aggregate[f"{key}_mean"] = sum(values) / len(values)
     for key in (
-        "shards_per_path_before",
-        "shards_per_path_after",
+        "shards_per_traj_before",
+        "shards_per_traj_after",
         "cstr_before",
         "cstr_after",
         "pre_refine_max_shard_size",
@@ -172,6 +211,7 @@ def run_partition_stage(cfg, train_days: List[int], source_dir: str, sharding_di
     Returns ``by_day`` ({day: {"shards", "sample"}}, the input of STEP 2), the partitions,
     the partition/build times and the refinement summary.
     """
+    t0_stage = time.time()
     partitioner = make_partitioner(cfg)
 
     partition_dir = os.path.join(sharding_dir, "partition")
@@ -201,26 +241,25 @@ def run_partition_stage(cfg, train_days: List[int], source_dir: str, sharding_di
             log(f"  [sharded-dir] {relpath_for_log(sharding_dir)} given — running from the first missing step")
 
     # ── Per-day Partition + Build ─────────────────────────────────────
-    log("=" * 60)
     by_day: dict = {}
     all_partitions: dict = {}
 
     if skip_partition:
-        log(f"STEP 1/3  Per-day Partition (SKIP — using {relpath_for_log(partition_dir)})")
+        log(f"STEP 1/3 partition: reusing the saved partitions of {len(train_days)} days")
         ensure_dir(partition_dir)
         t0_skip = time.time()
         partition_ms_total = 0
         build_ms_total = 0
         for day_id in train_days:
             sample = load_day_sample(source_dir, day_id)
-            partition = partitioner.load(partition_paths[day_id])
-            shards, day_build_ms = step_build_day(partition, sample, log, day_id, verbose=False)
+            partition = load_pickle(partition_paths[day_id])
+            shards, day_build_ms = step_build_day(partition, sample)
             build_ms_total += day_build_ms
             by_day[day_id]       = {"shards": shards, "sample": sample}
             all_partitions[day_id] = partition
-        log(f"  rebuilt {len(train_days)} days  {time.time()-t0_skip:.1f}s")
+        log(f"  shard subgraphs rebuilt  {time.time()-t0_skip:.0f}s")
     else:
-        log(f"STEP 1/3  Per-day Partition + Build  ({len(train_days)} days)")
+        log(f"STEP 1/3 partition ({len(train_days)} days, K={cfg.partition.num_shards})")
         ensure_dir(partition_dir)
         partition_ms_total = 0
         build_ms_total = 0
@@ -232,37 +271,35 @@ def run_partition_stage(cfg, train_days: List[int], source_dir: str, sharding_di
 
         fit_results: Dict[int, tuple] = {}
         num_workers = min(len(train_days), 8, max(1, (os.cpu_count() or 4) - 2))
-        log(f"  Parallel partition fit: {len(train_days)} day(s) across {num_workers} worker process(es)")
+        log(f"  partition fit: {len(train_days)} days on {num_workers} worker processes")
         t0_parallel = time.time()
         worker_args = [(cfg, d, source_dir) for d in train_days]
         ctx = mp.get_context("spawn")
         with ProcessPoolExecutor(max_workers=num_workers, mp_context=ctx) as executor:
-            for day_id, partition, pc, sample in executor.map(_partition_fit_worker, worker_args):
-                fit_results[day_id] = (partition, pc, sample)
+            for day_id, partition, tc, sample in executor.map(_partition_fit_worker, worker_args):
+                fit_results[day_id] = (partition, tc, sample)
         partition_ms_total += round((time.time() - t0_parallel) * 1000)
-        log(f"  Parallel partition fit done  {time.time()-t0_parallel:.1f}s")
+        log(f"  partition fit done  {time.time()-t0_parallel:.0f}s")
 
         # Temporal subgraph assignment must see the days in order.
+        t0_assign = time.time()
         for day_id in train_days:
-            partition, pc, sample = fit_results[day_id]
-            partition = partitioner.subgraph_assign(partition, pc)
-            partitioner.save(partition, partition_paths[day_id])
-            qm = partition.quality_metrics
-            log(f"  [day {day_id}] partition done  K={cfg.partition.num_shards}"
-                f"  shards/path={qm['shards_per_path']:.3f}"
-                f"  cstr={qm['cstr']:.3f}")
-            shards, day_build_ms = step_build_day(partition, sample, log, day_id)
+            partition, tc, sample = fit_results[day_id]
+            partition = partitioner.subgraph_assign(partition, tc)
+            save_pickle(partition, partition_paths[day_id])
+            shards, day_build_ms = step_build_day(partition, sample)
             build_ms_total += day_build_ms
             by_day[day_id]       = {"shards": shards, "sample": sample}
             all_partitions[day_id] = partition
+        log(f"  subgraph assignment done  {len(train_days)}/{len(train_days)} days  {time.time() - t0_assign:.0f}s")
 
     refinement_summary = _save_refinement_metrics(
         sharding_dir, all_partitions, cfg
     )
-    log(
-        "  Refinement metrics saved"
-        f"  → {relpath_for_log(os.path.join(sharding_dir, 'refinement_metrics.json'))}"
-    )
+    agg = refinement_summary["aggregate"]
+    if "shards_per_traj_after_mean" in agg:
+        log(f"  partition done  mean over {agg['days']} days: shards/traj {agg['shards_per_traj_after_mean']:.3f}"
+            f"  cstr {agg['cstr_after_mean']:.3f}  {time.time() - t0_stage:.0f}s")
 
 
     return {

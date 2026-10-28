@@ -10,7 +10,7 @@ matching on
   J_node   : Jaccard similarity of node sets.
   C_spatial: 1 / (1 + Euclidean distance) between grid-coordinate centroids
              (constant when no grid is available, e.g. static graphs).
-  J_user   : Jaccard similarity of the user sets of the subgraphs' paths.
+  J_user   : Jaccard similarity of the user sets of the subgraphs' trajs.
 
 The first day sets the references as is. Afterwards the node and user references
 of a model are the unions over the last `window_size` days assigned to it, and
@@ -21,8 +21,6 @@ must see the days in order.
 
 from __future__ import annotations
 
-import os
-import pickle
 from collections import defaultdict, deque
 from typing import Deque, Dict, Optional, Set
 
@@ -37,22 +35,6 @@ SPATIAL_REFERENCE_DECAY = 0.8
 Descriptor = Dict[str, object]  # {"node_set": set, "spatial_centroid": ndarray, "uid_set": set}
 
 
-def load_grid_info(processed_dir: str) -> Optional[Dict[str, int]]:
-    """Grid origin and height for node-id -> (x, y); None when the dataset has no grid."""
-    if not processed_dir:
-        return None
-    path = os.path.join(processed_dir, "grid_info.pickle")
-    if not os.path.isfile(path):
-        return None
-    with open(path, "rb") as f:
-        info = pickle.load(f)
-    return {
-        "x_min": int(info["x_min"]),
-        "y_min": int(info["y_min"]),
-        "y_size": int(info["y_size"]),
-    }
-
-
 class TemporalSubgraphAssigner:
     """Keeps the per-model references and relabels each day's partition."""
 
@@ -62,13 +44,13 @@ class TemporalSubgraphAssigner:
         # Node/user sets of the last `window_size` days, per model slot.
         self.history: Deque[Dict[int, Dict[str, Set]]] = deque(maxlen=max(1, int(window_size)))
 
-    def assign(self, partition, pc):
+    def assign(self, partition, tc):
         """Relabel `partition` so shard ids are model slots; returns the same object."""
         K = len(partition.shards_nodes)
         if K == 0:
             return partition
 
-        descriptors = self._build_descriptors(partition, pc)
+        descriptors = self._build_descriptors(partition, tc)
 
         if self.reference is None:
             # First day: identity assignment, references seeded from this day.
@@ -90,12 +72,12 @@ class TemporalSubgraphAssigner:
         partition.quality_metrics["temporal_assignment_score"] = assignment_score
         return partition
 
-    def _build_descriptors(self, partition, pc) -> Dict[int, Descriptor]:
+    def _build_descriptors(self, partition, tc) -> Dict[int, Descriptor]:
         node_uids: Dict[int, Set[int]] = defaultdict(set)
-        for path, uid in zip(pc.paths, pc.path_uids):
+        for traj, uid in zip(tc.trajs, tc.traj_uids):
             if uid is None:
                 continue
-            for n in path:
+            for n in traj:
                 node_uids[int(n)].add(uid)
 
         grid_info = self.grid_info

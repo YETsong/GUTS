@@ -30,7 +30,7 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from guts.yjmob.model.trainer import SingleProcess, build_arg_parser, run_training
+from guts.yjmob.model.trainer import SingleProcess, build_arg_parser, run_training, summary_line
 
 
 class DDPContext(SingleProcess):
@@ -102,7 +102,9 @@ def main() -> None:
     args = build_arg_parser("GraphSAGE + GRU next-grid training (multi-GPU data parallel).").parse_args()
     ctx = DDPContext()
     try:
-        run_training(args, ctx, log_label=ctx.rank)
+        results = run_training(args, ctx)
+        if results is not None:  # rank 0
+            print(summary_line(results), flush=True)
     finally:
         ctx.close()
 
